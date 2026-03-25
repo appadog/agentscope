@@ -31,6 +31,8 @@ src/agentscope/
 └── embedding/    # 임베딩 모델
 ```
 
+**[→ 단계별 사용 가이드](./guide.md)**
+
 ---
 
 ## 핵심 모듈 분석
