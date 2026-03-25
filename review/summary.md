@@ -33,7 +33,7 @@ src/agentscope/
 
 ---
 
-## 핵심 모듈 요약
+## 핵심 모듈 분석
 
 | 모듈 | 역할 | 상세 분석 |
 |------|------|-----------|
@@ -55,6 +55,41 @@ src/agentscope/
 | [tuner](./tuner.md) | 프롬프트/모델 자동 최적화 | [→](./tuner.md) |
 | [hooks](./hooks.md) | Studio 연동 pre/post 훅 | [→](./hooks.md) |
 | [embedding](./embedding.md) | 임베딩 모델 + 캐싱 | [→](./embedding.md) |
+
+---
+
+## 예제 분석 (examples/)
+
+> 8개 카테고리, 92개 파이썬 파일 — [전체 예제 개요](./examples/overview.md)
+
+| 카테고리 | 내용 | 상세 분석 |
+|----------|------|-----------|
+| [에이전트 예제](./examples/agents.md) | ReAct, A2A, 실시간 음성, 브라우저, 딥리서치, 메타 플래너 | [→](./examples/agents.md) |
+| [기능 예제](./examples/functionality.md) | RAG, 메모리, 구조화 출력, 플래닝, MCP, TTS, 세션 | [→](./examples/functionality.md) |
+| [워크플로우 예제](./examples/workflows.md) | 멀티에이전트 대화, 토론, 동시 실행, 실시간 | [→](./examples/workflows.md) |
+| [배포 예제](./examples/deployment.md) | Quart 기반 프로덕션 서버, SSE 스트리밍 | [→](./examples/deployment.md) |
+| [게임 예제](./examples/game.md) | 늑대인간 게임 시뮬레이션 | [→](./examples/game.md) |
+| [평가 예제](./examples/evaluation.md) | ACE-Bench, Ray 분산 평가 | [→](./examples/evaluation.md) |
+| [튜너 예제](./examples/tuner.md) | 프롬프트 튜닝, 모델 선택, 파인튜닝 | [→](./examples/tuner.md) |
+| [통합 예제](./examples/integration.md) | Qwen 딥리서치, 알리바바 클라우드 MCP | [→](./examples/integration.md) |
+
+---
+
+## 테스트 분석 (tests/)
+
+> 54개 테스트 파일, 모든 핵심 모듈 커버 — [전체 테스트 개요](./tests/overview.md)
+
+| 카테고리 | 파일 수 | 상세 분석 |
+|----------|---------|-----------|
+| [에이전트 테스트](./tests/agents.md) | 5 | AgentBase, ReAct, A2A 훅/통신 | [→](./tests/agents.md) |
+| [포매터 테스트](./tests/formatters.md) | 7 | OpenAI, Anthropic, Gemini, DashScope 포맷 변환 | [→](./tests/formatters.md) |
+| [모델 테스트](./tests/models.md) | 5 | LLM API 통합, 스트리밍, 구조화 출력 | [→](./tests/models.md) |
+| [메모리 테스트](./tests/memory.md) | 4 | 워킹 메모리, 압축, ReMe, mem0 | [→](./tests/memory.md) |
+| [툴 테스트](./tests/tools.md) | 5 | 코드 실행, 파일 조작, Toolkit | [→](./tests/tools.md) |
+| [RAG 테스트](./tests/rag.md) | 3 | 문서 리더, 벡터 스토어, 지식 베이스 | [→](./tests/rag.md) |
+| [실시간 테스트](./tests/realtime.md) | 4 | WebSocket, 이벤트 변환, 음성 | [→](./tests/realtime.md) |
+| [추적 테스트](./tests/tracing.md) | 4 | 데코레이터, 스팬 변환, 추출 | [→](./tests/tracing.md) |
+| [기타 테스트](./tests/others.md) | 17 | TTS, MCP, 토큰, 세션, 파이프라인 등 | [→](./tests/others.md) |
 
 ---
 
