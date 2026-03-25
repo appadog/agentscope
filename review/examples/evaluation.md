@@ -8,127 +8,137 @@
 
 ## ace_bench — ACE 벤치마크 평가
 
+ACE-Bench(에이전트 능력 평가 벤치마크)를 Ray 분산 평가로 실행하는 예제.
+
 **파일**: `main.py`
 
-**목적**: `ACEBenchmark`와 `RayEvaluator`를 사용하여 ReAct 에이전트를 분산 환경에서 체계적으로 평가하는 예제.
-
 ---
 
-## 핵심 코드
+## 실제 코드
 
 ```python
-from agentscope.evaluate import (
-    ACEBenchmark,
-    RayEvaluator,
-    FileEvaluatorStorage,
-)
+# examples/evaluation/ace_bench/main.py
 
-# 벤치마크 정의
-benchmark = ACEBenchmark()
+async def react_agent_solution(
+    ace_task: Task,
+    pre_hook: Callable,
+) -> SolutionOutput:
+    """ACE 태스크를 ReAct 에이전트로 풀기"""
 
-# 결과 저장소
-storage = FileEvaluatorStorage(save_dir="./results/ace_bench/")
+    # 태스크에서 툴 동적 등록
+    toolkit = Toolkit()
+    for tool, json_schema in ace_task.metadata["tools"]:
+        toolkit.register_tool_function(tool, json_schema=json_schema)
 
-# Ray 분산 평가 실행기
-evaluator = RayEvaluator(
-    name="react_agent_eval",
-    benchmark=benchmark,
-    n_repeat=3,         # 각 태스크 3회 반복 실행
-    n_workers=8,        # Ray 병렬 워커 수
-    storage=storage,
-)
-
-# 평가할 솔루션 정의 (에이전트 생성 + 응답 수집)
-async def solution(task: Task) -> SolutionOutput:
     agent = ReActAgent(
-        name="test_agent",
-        model=DashScopeChatModel(model_name="qwen-max"),
-        toolkit=Toolkit(),
-        memory=InMemoryMemory(),
+        name="Friday",
+        sys_prompt="You are a helpful assistant named Friday. "
+                   "Your target is to solve the given task with your tools.",
+        model=DashScopeChatModel(
+            api_key=os.environ.get("DASHSCOPE_API_KEY"),
+            model_name="qwen3-max",
+            stream=False,
+        ),
+        formatter=DashScopeChatFormatter(),
+        toolkit=toolkit,
     )
 
-    response = await agent.reply(
-        Msg(name="user", content=task.metadata["question"], role="user")
-    )
+    # pre_print 훅으로 에이전트 입력 메시지 로깅
+    agent.register_instance_hook("pre_print", "save_logging", pre_hook)
+
+    msg_input = Msg("user", ace_task.input, role="user")
+    await agent.print(msg_input)  # pre_print 훅 트리거
+    await agent(msg_input)
+
+    # 툴 호출 궤적 수집
+    traj = []
+    for msg in await agent.memory.get_memory():
+        traj.extend(msg.get_content_blocks(["tool_use", "tool_result"]))
+
+    # 최종 상태 (폰/여행 시스템)
+    phone: ACEPhone = ace_task.metadata["phone"]
+    final_state = phone.get_current_state()
 
     return SolutionOutput(
-        task_id=task.id,
-        output=response.content,
-        metadata={"trajectory": agent.memory.get_all()},
+        success=True,
+        output=final_state,
+        trajectory=traj,
     )
 
-# 평가 실행
-results = await evaluator.run(solution)
 
-# 결과 집계
-summary = await evaluator.aggregate()
-print(f"정확도: {summary['accuracy']:.2%}")
-print(f"평균 응답 시간: {summary['avg_time']:.2f}s")
+async def main():
+    evaluator = RayEvaluator(
+        name="ACEbench evaluation",
+        benchmark=ACEBenchmark(data_dir=args.data_dir),
+        n_repeat=1,
+        storage=FileEvaluatorStorage(save_dir=args.result_dir),
+        n_workers=args.n_workers,
+    )
+    await evaluator.run(react_agent_solution)
+```
+
+**실행 방법:**
+```bash
+python main.py \
+    --data_dir ./ace_data \
+    --result_dir ./results \
+    --n_workers 4
 ```
 
 ---
 
-## 평가 흐름
+## 평가 프레임워크 구성요소
 
-```
-ACEBenchmark.get_tasks()
-  → [Task1, Task2, ..., TaskN]
-        ↓
-RayEvaluator.run(solution)
-  → Ray 클러스터에서 병렬 실행
-  → n_workers 개의 워커가 태스크 분배 처리
-  → n_repeat 회 반복으로 안정성 측정
-        ↓
-MetricBase.__call__(output, ground_truth)
-  → MetricResult (점수, 근거)
-        ↓
-FileEvaluatorStorage.save()
-  → ./results/ace_bench/
-        ↓
-evaluator.aggregate()
-  → 전체 성능 요약 (평균, 표준편차)
-```
+| 컴포넌트 | 클래스 | 역할 |
+|---------|--------|------|
+| 벤치마크 | `ACEBenchmark` | 태스크 로딩 및 정답 관리 |
+| 솔루션 | `react_agent_solution` | 태스크 해결 함수 |
+| 출력 | `SolutionOutput` | `success`, `output`, `trajectory` |
+| 평가자 | `RayEvaluator` | Ray 분산 실행 |
+| 저장소 | `FileEvaluatorStorage` | 결과 JSON 파일 저장 |
+| 툴 환경 | `ACEPhone` | 스마트폰/앱 시뮬레이션 |
 
 ---
 
-## 사전 훅 (Pre-hook) 활용
+## 핵심 패턴
+
+**동적 툴 등록:**
+```python
+for tool, json_schema in ace_task.metadata["tools"]:
+    toolkit.register_tool_function(tool, json_schema=json_schema)
+```
+- 각 태스크마다 서로 다른 툴 세트를 주입
+- `json_schema` 직접 지정 — 독스트링 파싱 없이 스키마 지정 가능
+
+**pre_print 훅으로 입력 로깅:**
+```python
+agent.register_instance_hook("pre_print", "save_logging", pre_hook)
+await agent.print(msg_input)  # 훅 트리거
+```
+
+**툴 궤적 수집:**
+```python
+traj.extend(msg.get_content_blocks(["tool_use", "tool_result"]))
+```
+- 메모리에서 `tool_use`/`tool_result` 블록만 추출하여 평가 데이터로 활용
+
+---
+
+## GeneralEvaluator vs RayEvaluator
 
 ```python
-# 평가 전 로깅 훅 등록
-async def logging_pre_hook(agent, *args, **kwargs):
-    logger.info(f"태스크 시작: {args[0].content[:50]}")
-    return args, kwargs
+# 로컬 디버깅용 (Ray 없이)
+from agentscope.evaluate import GeneralEvaluator
 
-agent.pre_reply.append(logging_pre_hook)
-```
-
----
-
-## ACEBenchmark 태스크 유형
-
-| 유형 | 설명 |
-|------|------|
-| QA | 단답형 질의응답 |
-| 멀티턴 대화 | 여러 턴에 걸친 대화 능력 |
-| 툴 호출 | 적절한 툴 선택 및 사용 |
-| 계획 수립 | 복잡한 태스크 분해 능력 |
-
----
-
-## Ray 설정
-
-```python
-import ray
-
-ray.init(
-    num_cpus=8,
-    runtime_env={
-        "pip": ["agentscope[evaluate]"],
-    },
+evaluator = GeneralEvaluator(
+    benchmark=ACEBenchmark(data_dir="./data"),
+    n_repeat=1,
+    n_workers=2,  # asyncio 병렬
 )
 
-# 평가 완료 후
-ray.shutdown()
+# 분산 실행용 (Ray 필요)
+evaluator = RayEvaluator(
+    benchmark=ACEBenchmark(data_dir="./data"),
+    n_workers=8,  # Ray 워커 수
+)
 ```
-
-분산 환경에서 수백 개의 태스크를 동시에 평가 가능.

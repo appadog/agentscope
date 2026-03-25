@@ -12,140 +12,158 @@
 
 **파일**: `example.py`
 
-DSPy의 MIPROv2 알고리즘으로 시스템 프롬프트를 자동 최적화.
+GSM8K 수학 데이터셋으로 ReAct 에이전트의 시스템 프롬프트를 DSPy MIPROv2로 최적화.
+
+**실제 코드:**
 
 ```python
-from agentscope.tuner import tune_prompt, PromptTuneConfig
+# examples/tuner/prompt_tuning/example.py
+model = DashScopeChatModel(
+    "qwen-flash",
+    api_key=os.environ.get("DASHSCOPE_API_KEY", ""),
+    max_tokens=512,
+)
 
-# 최적화할 워크플로우 정의
-async def my_workflow(
-    inputs: dict,
-    system_prompt: str,     # 튜닝 대상 프롬프트
-) -> WorkflowOutput:
+
+async def workflow(task: dict, system_prompt: str) -> WorkflowOutput:
+    """최적화될 워크플로우 함수"""
+    toolkit = Toolkit()
+    toolkit.register_tool_function(execute_python_code)
+
     agent = ReActAgent(
-        sys_prompt=system_prompt,
-        model=DashScopeChatModel(model_name="qwen-max"),
-        ...
+        name="react_agent",
+        sys_prompt=system_prompt,  # 이 프롬프트가 최적화됨
+        model=model,
+        formatter=OpenAIChatFormatter(),
+        toolkit=toolkit,
+        print_hint_msg=False,
     )
-    response = await agent.reply(Msg(content=inputs["question"]))
-    return WorkflowOutput(answer=response.content)
+    agent.set_console_output_enabled(False)
 
-# 평가 함수
-async def judge(
-    output: WorkflowOutput,
-    expected: dict,
-) -> JudgeOutput:
-    is_correct = output.answer.strip() == expected["answer"].strip()
-    return JudgeOutput(score=1.0 if is_correct else 0.0)
+    response = await agent.reply(
+        msg=Msg("user", task["question"], role="user"),
+    )
+    return WorkflowOutput(response=response)
+
+
+async def gsm8k_judge(task: dict, response: Msg) -> JudgeOutput:
+    """정답 판별 함수 (보상 계산)"""
+    from trinity.common.rewards.math_reward import MathBoxedRewardFn
+
+    reward_fn = MathBoxedRewardFn()
+
+    # GSM8K 정답 파싱 ("#### 42" → "42")
+    truth = task["answer"]
+    if isinstance(truth, str) and "####" in truth:
+        truth = truth.split("####")[1].strip()
+
+    result = response.get_text_content()
+    reward_dict = reward_fn(response=result, truth=truth)
+
+    return JudgeOutput(
+        reward=sum(reward_dict.values()),
+        metrics=reward_dict,
+    )
+
 
 # 프롬프트 튜닝 실행
-result = await tune_prompt(
-    workflow_func=my_workflow,
-    judge_func=judge,
-    train_dataset=DatasetConfig(path="./train.jsonl"),
-    eval_dataset=DatasetConfig(path="./eval.jsonl"),
+init_prompt = (
+    "You are an agent. Please solve the math problem given to you with python code. "
+    "You should provide your output within \\boxed{{}}."
+)
+
+optimized_prompt = tune_prompt(
+    workflow=workflow,
+    init_system_prompt=init_prompt,
+    judge_func=gsm8k_judge,
+    train_dataset=DatasetConfig(path="train.parquet", name="", split=""),
+    eval_dataset=DatasetConfig(path="test.parquet", name="", split=""),
     config=PromptTuneConfig(
-        num_candidates=10,          # 생성할 프롬프트 후보 수
-        max_bootstrapped_demos=3,   # 최대 예제 수
-        num_trials=20,              # 베이지안 최적화 시도 횟수
+        lm_model_name="dashscope/qwen3-max",
+        optimization_level="medium",   # "light" | "medium" | "heavy"
     ),
 )
 
-print(f"최적 프롬프트:\n{result.best_prompt}")
-print(f"평가 점수: {result.best_score:.2%}")
+print(f"Optimized prompt: {optimized_prompt}")
 ```
 
-**MIPROv2 동작 원리**:
-1. 훈련 데이터에서 여러 프롬프트 후보 자동 생성
-2. 각 후보를 훈련 데이터로 평가
-3. 베이지안 최적화로 최고 성능 프롬프트 탐색
-4. 평가 데이터로 최종 검증
+**`tune_prompt()` 파라미터:**
+| 파라미터 | 설명 |
+|---------|------|
+| `workflow` | 최적화할 에이전트 워크플로우 함수 |
+| `init_system_prompt` | 초기 시스템 프롬프트 |
+| `judge_func` | 응답 품질 평가 함수 (보상 반환) |
+| `train_dataset` | 훈련 데이터셋 설정 |
+| `eval_dataset` | 평가 데이터셋 설정 |
+| `config.optimization_level` | `"light"` / `"medium"` / `"heavy"` |
 
 ---
 
-## 2. model_selection — 모델 비교 선택
+## 2. model_selection — 모델 선택
 
-### BLEU 점수 기준 선택
+**파일**: `example_bleu.py`, `example_token_usage.py`
 
-**파일**: `example_bleu.py`
+여러 모델 중 최적 모델을 자동 선택.
+
+### example_bleu.py — BLEU 점수 기반
 
 ```python
 from agentscope.tuner import select_model
 
-result = await select_model(
-    workflow_func=translation_workflow,
-    judge_func=bleu_judge,
-    eval_dataset=DatasetConfig(path="./eval_translation.jsonl"),
-    candidate_models=[
-        "gpt-4o-mini",
-        "claude-haiku-4-5-20251001",
-        "gemini-1.5-flash",
-        "qwen-max",
+best_model = await select_model(
+    candidates=[
+        DashScopeChatModel("qwen-max", ...),
+        DashScopeChatModel("qwen-turbo", ...),
+        DashScopeChatModel("qwen-plus", ...),
     ],
+    workflow=translation_workflow,
+    eval_dataset=DatasetConfig(path="eval.parquet"),
+    metric="bleu",
 )
-
-print(f"최적 모델: {result.best_model}")
-print(f"모델별 점수:")
-for model, score in result.scores.items():
-    print(f"  {model}: {score:.4f}")
 ```
 
-### 토큰 사용량 기준 선택
-
-**파일**: `example_token_usage.py`
+### example_token_usage.py — 토큰 사용량 기반
 
 ```python
-result = await select_model(
-    ...
-    selection_metric="cost_efficiency",  # 비용 효율 기준
-    cost_weights={
-        "gpt-4o-mini": 0.15,      # $/1M 토큰
-        "claude-haiku": 0.25,
-        "gemini-flash": 0.075,
-    },
+best_model = await select_model(
+    candidates=[...],
+    workflow=workflow,
+    eval_dataset=eval_dataset,
+    metric="token_usage",  # 비용 최소화
 )
 ```
 
 ---
 
-## 3. model_tuning — 모델 파인튜닝
+## 3. model_tuning — 모델 파인튜닝 (Agentic RL)
 
 **파일**: `main.py`
 
-Trinity-RFT와 연동하여 강화학습 기반 파인튜닝 수행.
+Trinity-RFT 프레임워크를 사용한 강화학습 기반 모델 파인튜닝.
 
 ```python
 from agentscope.tuner import tune
 
-result = await tune(
-    workflow_func=coding_workflow,
-    judge_func=code_correctness_judge,
-    train_dataset=DatasetConfig(
-        path="bigcode/the-stack",  # HuggingFace 데이터셋
-        split="train",
-        input_field="prompt",
-        output_field="solution",
+# 강화학습 파인튜닝
+tuned_model = await tune(
+    workflow=agent_workflow,
+    judge_func=reward_function,
+    train_dataset=DatasetConfig(path="train.parquet"),
+    config=TuneConfig(
+        base_model="qwen3-7b",
+        training_method="grpo",  # Group Relative Policy Optimization
+        n_epochs=3,
+        batch_size=16,
     ),
-    eval_dataset=DatasetConfig(...),
-    model=ModelConfig(name="qwen2.5-7b"),
-    algorithm=AlgorithmConfig(
-        type="rl_finetuning",
-        rl_algorithm="GRPO",
-        num_epochs=3,
-        learning_rate=1e-5,
-        batch_size=32,
-    ),
-    project_name="code_assistant",
-    monitor_type="wandb",
 )
 ```
 
 ---
 
-## 최적화 방법 비교
+## 세 가지 최적화 비교
 
-| 방법 | 시간 | 비용 | 효과 | 적합한 경우 |
-|------|------|------|------|------------|
-| 프롬프트 튜닝 | 수 분 | 낮음 | 중간 | 빠른 개선, 기존 모델 유지 |
-| 모델 선택 | 수 분 | 중간 | 중간 | 최적 모델 탐색 |
-| 파인튜닝 | 수 시간 | 높음 | 높음 | 특수 도메인, 최고 성능 필요 |
+| 방식 | 대상 | 비용 | 사용 시기 |
+|------|------|------|---------|
+| `tune_prompt()` | 시스템 프롬프트 | 낮음 (API 호출만) | 모델 고정, 프롬프트 개선 |
+| `select_model()` | 모델 선택 | 낮음 | 여러 모델 중 최적 선택 |
+| `tune()` | 모델 가중치 | 높음 (GPU 필요) | 특정 태스크 전용 모델 |

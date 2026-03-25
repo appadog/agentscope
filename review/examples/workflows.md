@@ -4,169 +4,197 @@
 
 ## 위치: `examples/workflows/`
 
-멀티 에이전트 협력 패턴을 시연하는 4가지 워크플로우 예제.
-
 ---
 
 ## 1. multiagent_conversation — 그룹 대화
 
 **파일**: `main.py`
 
-여러 에이전트가 공통 주제로 그룹 대화를 나누는 패턴.
+`MsgHub`로 여러 에이전트가 공통 대화 컨텍스트를 공유하는 패턴.
+
+**실제 코드:**
 
 ```python
-from agentscope.pipeline import MsgHub, sequential_pipeline
+# examples/workflows/multiagent_conversation/main.py
+def create_participant_agent(name, age, career, character) -> ReActAgent:
+    return ReActAgent(
+        name=name,
+        sys_prompt=(
+            f"You're a {age}-year-old {career} named {name} and you're "
+            f"a {character} person."
+        ),
+        model=DashScopeChatModel(
+            model_name="qwen-max",
+            api_key=os.environ["DASHSCOPE_API_KEY"],
+            stream=True,
+        ),
+        formatter=DashScopeMultiAgentFormatter(),  # 멀티에이전트용 포매터
+    )
 
-# 에이전트 생성
-host = ReActAgent(name="사회자", sys_prompt="그룹 대화를 진행하세요.", ...)
-agent_a = ReActAgent(name="Alice", sys_prompt="친절한 성격을 가지고 있습니다.", ...)
-agent_b = ReActAgent(name="Bob", sys_prompt="분석적인 성격을 가지고 있습니다.", ...)
-agent_c = ReActAgent(name="Carol", sys_prompt="창의적인 성격을 가지고 있습니다.", ...)
+alice = create_participant_agent("Alice", 30, "teacher", "friendly")
+bob   = create_participant_agent("Bob", 14, "student", "rebellious")
+charlie = create_participant_agent("Charlie", 28, "doctor", "thoughtful")
 
-# MsgHub: 모든 에이전트의 응답이 자동으로 전체 참가자에게 전달
 async with MsgHub(
-    participants=[host, agent_a, agent_b, agent_c],
-    announcement=Msg(
-        name="system",
-        role="system",
-        content="각자 자기소개를 해주세요.",
-    ),
+    participants=[alice, bob, charlie],
+    announcement=Msg("system", "Now you meet each other with a brief self-introduction.", "system"),
 ) as hub:
-    # 순차 진행: 사회자 → Alice → Bob → Carol
-    await sequential_pipeline([host, agent_a, agent_b, agent_c], initial_msg)
+    # 순차 파이프라인으로 한 번씩 발언
+    await sequential_pipeline([alice, bob, charlie])
+
+    # Bob 퇴장 처리
+    hub.delete(bob)
+    await hub.broadcast(
+        Msg("bob", "I have to start my homework now, see you later!", "assistant")
+    )
+    await alice()
+    await charlie()
 ```
 
-**핵심 동작**:
-- `MsgHub` 내에서 에이전트가 응답하면 다른 모든 참가자에게 자동 전달
-- `announcement` 메시지는 컨텍스트 시작 시 전달되는 공지
+**핵심 포인트:**
+- `DashScopeMultiAgentFormatter` — 여러 에이전트 이름이 프롬프트에 등장할 때 필수
+- `hub.delete(bob)` — 실행 중 참가자 제거
+- `hub.broadcast()` — 모든 참가자에게 메시지 전달
 
 ---
 
-## 2. multiagent_debate — 구조화된 토론
+## 2. multiagent_debate — 멀티에이전트 토론
 
 **파일**: `main.py`
 
-찬성/반대 두 에이전트가 토론하고, 심판 에이전트가 결론을 내리는 패턴.
+두 토론자(Alice, Bob)와 사회자(Aggregator)가 수학 문제를 토론으로 해결.
+
+**실제 코드:**
 
 ```python
-class JudgeOutput(BaseModel):
-    winner: Literal["찬성", "반대", "무승부"]
-    reason: str
-    is_finished: bool
+# examples/workflows/multiagent_debate/main.py
+topic = "The two circles are externally tangent ... How many times will circle A revolve?"
 
-affirmative = ReActAgent(
-    name="찬성측",
-    sys_prompt="주어진 주제에 찬성 입장을 논리적으로 주장하세요.",
-    ...
+def create_solver_agent(name: str) -> ReActAgent:
+    return ReActAgent(
+        name=name,
+        sys_prompt=f"You're a debater named {name}. ... The debate topic is: {topic}",
+        model=DashScopeChatModel(model_name="qwen-max", ...),
+        formatter=DashScopeChatFormatter(),
+    )
+
+alice, bob = [create_solver_agent(name) for name in ["Alice", "Bob"]]
+
+moderator = ReActAgent(
+    name="Aggregator",
+    sys_prompt="You're a moderator. ...",
+    model=DashScopeChatModel(model_name="qwen-max", ...),
+    formatter=DashScopeMultiAgentFormatter(),  # 멀티에이전트 포매터
 )
-negative = ReActAgent(
-    name="반대측",
-    sys_prompt="주어진 주제에 반대 입장을 논리적으로 주장하세요.",
-    ...
-)
-judge = ReActAgent(
-    name="심판",
-    sys_prompt="토론 내용을 평가하고 승자를 결정하세요.",
-    ...
-)
 
-topic = Msg(name="user", content="AI는 인간의 일자리를 대체할 것인가?", role="user")
+class JudgeModel(BaseModel):
+    finished: bool = Field(description="Whether the debate is finished.")
+    correct_answer: str | None = Field(description="The correct answer, if finished.", default=None)
 
-async with MsgHub(participants=[affirmative, negative, judge]) as hub:
-    for round_num in range(3):
-        affirmative_msg = await affirmative.reply(topic)
-        negative_msg = await negative.reply(affirmative_msg)
+async def run_multiagent_debate():
+    while True:
+        # Alice, Bob은 MsgHub 안에서 서로의 메시지를 봄
+        async with MsgHub(participants=[alice, bob, moderator]):
+            await alice(Msg("user", "You are affirmative side...", "user"))
+            await bob(Msg("user", "You are negative side...", "user"))
 
-        # 심판이 구조화된 출력으로 결론 판정
-        judgment = await judge.reply(
-            negative_msg,
-            structured_model=JudgeOutput,
+        # 사회자는 MsgHub 밖에서 판단 (Alice, Bob은 판결 메시지를 못 봄)
+        msg_judge = await moderator(
+            Msg("user", "Have the debate finished, and can you get the correct answer?", "user"),
+            structured_model=JudgeModel,
         )
 
-        if judgment.metadata.is_finished:
+        if msg_judge.metadata.get("finished"):
+            print("Correct answer:", msg_judge.metadata.get("correct_answer"))
             break
 ```
 
+**핵심 패턴:**
+- `MsgHub` 안: 토론자들이 서로의 메시지를 공유
+- `MsgHub` 밖: 사회자만 판결 — 토론자들은 판결 내용 모름
+- `JudgeModel`로 종료 조건을 구조화 출력으로 판별
+
 ---
 
-## 3. multiagent_concurrent — 병렬 실행
+## 3. multiagent_concurrent — 병렬 동시 실행
 
 **파일**: `main.py`
 
-여러 에이전트를 동시에 실행하여 처리 시간을 단축하는 패턴.
+`asyncio.gather` 와 `fanout_pipeline`으로 여러 에이전트를 동시 실행.
+
+**실제 코드:**
 
 ```python
-import asyncio
-from agentscope.pipeline import fanout_pipeline
+# examples/workflows/multiagent_concurrent/main.py
+class ExampleAgent(AgentBase):
+    def __init__(self, name: str):
+        super().__init__()
+        self.name = name
 
-# 병렬 실행 (asyncio.gather 내부 사용)
-start = time.time()
-results = await fanout_pipeline(
-    agents=[agent1, agent2, agent3, agent4],
-    msg=question,
-    sequential=False,   # 병렬 모드
+    async def reply(self, *args, **kwargs) -> Msg:
+        start_time = datetime.now()
+        await self.print(Msg(self.name, f"begins at {start_time.strftime('%H:%M:%S.%f')}", "assistant"))
+
+        await asyncio.sleep(np.random.choice([2, 3, 4]))  # 랜덤 지연
+
+        end_time = datetime.now()
+        msg = Msg(
+            self.name,
+            f"finishes at {end_time.strftime('%H:%M:%S.%f')}",
+            "user",
+            metadata={"time": (end_time - start_time).total_seconds()},
+        )
+        return msg
+
+alice = ExampleAgent("Alice")
+bob   = ExampleAgent("Bob")
+chalice = ExampleAgent("Chalice")
+
+# 방법 1: asyncio.gather 직접 사용
+await asyncio.gather(*[alice(), bob(), chalice()])
+
+# 방법 2: fanout_pipeline
+collected_res = await fanout_pipeline(
+    agents=[alice, bob, chalice],
+    enable_gather=True,
 )
-parallel_time = time.time() - start
 
-# 순차 실행 (비교용)
-start = time.time()
-results = await fanout_pipeline(
-    agents=[agent1, agent2, agent3, agent4],
-    msg=question,
-    sequential=True,    # 순차 모드
-)
-sequential_time = time.time() - start
-
-print(f"병렬: {parallel_time:.2f}s vs 순차: {sequential_time:.2f}s")
+# 결과 분석
+avg_time = np.mean([res.metadata["time"] for res in collected_res])
+print(f"Average time: {avg_time} seconds")
 ```
 
-**측정 결과 예시**: 4개 에이전트 병렬 실행 시 순차 대비 ~3.5x 빠름.
+**핵심 포인트:**
+- `asyncio.gather()` — 파이썬 표준 비동기 병렬 실행
+- `fanout_pipeline(enable_gather=True)` — AgentScope 래퍼 (결과 수집 포함)
+- `metadata` 필드로 부가 정보 전달
 
 ---
 
-## 4. multiagent_realtime — 실시간 음성 멀티 에이전트
+## 4. multiagent_realtime — 실시간 멀티에이전트
 
-**파일**: `run_server.py`, `multi_agent.html`
+**파일**: `run_server.py`
 
-여러 음성 에이전트가 `ChatRoom`에서 함께 대화하는 실시간 음성 패턴.
+WebSocket 기반 실시간 음성 멀티에이전트 시스템.
 
 ```python
-from agentscope.pipeline import ChatRoom
+# run_server.py (개요)
+from agentscope.agent import RealtimeAgent
 
-# 여러 실시간 에이전트 생성
-agent1 = RealtimeAgent(
-    name="Alice",
-    realtime_model=OpenAIRealtimeModel(...),
-    instructions="당신은 Alice입니다.",
+agent = RealtimeAgent(
+    name="voice_assistant",
+    model=DashScopeRealtimeModel(...),
 )
-agent2 = RealtimeAgent(
-    name="Bob",
-    realtime_model=GeminiRealtimeModel(...),
-    instructions="당신은 Bob입니다.",
-)
-
-# ChatRoom에서 에이전트 이벤트 라우팅
-room = ChatRoom(agents=[agent1, agent2])
-
-@app.websocket("/ws/{user_id}")
-async def ws_endpoint(websocket: WebSocket, user_id: str):
-    outgoing_queue = asyncio.Queue()
-
-    async with room:
-        await room.start(outgoing_queue)
-
-        # 클라이언트 오디오 → 에이전트들에게 전달
-        async for event in websocket.iter_json():
-            await room.broadcast(event)
+# WebSocket 서버로 실시간 오디오 스트리밍
 ```
 
 ---
 
-## 워크플로우 패턴 비교
+## 패턴 비교
 
-| 패턴 | 에이전트 관계 | 통신 방식 | 적합한 시나리오 |
-|------|------------|----------|----------------|
-| 그룹 대화 | 평등 (P2P) | MsgHub 브로드캐스트 | 아이디어 토론, 집단 창작 |
-| 토론 | 역할 분리 | 순차 + 심판 | 의사결정, 검증 |
-| 병렬 실행 | 독립 | fanout_pipeline | 대량 처리, 앙상블 |
-| 실시간 음성 | 공존 | ChatRoom 이벤트 | 음성 비서, 회의 |
+| 워크플로우 | 패턴 | 에이전트 관계 | 포매터 |
+|-----------|------|-------------|--------|
+| multiagent_conversation | MsgHub + sequential_pipeline | 순차 발언, 공유 컨텍스트 | `DashScopeMultiAgentFormatter` |
+| multiagent_debate | MsgHub 안/밖 분리 | 토론자 vs 사회자 | MultiAgent + Single 혼합 |
+| multiagent_concurrent | asyncio.gather / fanout_pipeline | 독립 병렬 실행 | 각자 독립 |
+| multiagent_realtime | WebSocket | 실시간 음성 | RealtimeModel |

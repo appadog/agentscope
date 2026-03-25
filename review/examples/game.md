@@ -8,121 +8,158 @@
 
 ## werewolves — 늑대인간 게임
 
-**파일**: `main.py`, `game.py`, `prompt.py`, `structured_model.py`, `utils.py`, `README.md`
+9명이 참여하는 완전한 늑대인간(마피아) 게임 시뮬레이션. 구조화 출력으로 각 역할의 행동을 제어.
 
-**목적**: 멀티 에이전트 시스템의 복잡한 역할 기반 상호작용과 전략적 의사소통을 시연하는 시뮬레이션.
-
----
-
-## 게임 구성
-
-**플레이어 (10명)**:
-
-| 역할 | 수 | 능력 |
-|------|---|------|
-| 늑대인간 | 3 | 밤에 마을 주민 제거 |
-| 마을 주민 | 3 | 토론 및 투표 |
-| 예언자 | 1 | 매 밤 한 명의 역할 확인 |
-| 마녀 | 1 | 독약/해독약 각 1회 사용 |
-| 사냥꾼 | 1 | 탈락 시 한 명 지목 제거 |
-| 사회자 | 1 (AI) | 게임 진행 관리 |
+**파일 구조:**
+```
+werewolves/
+├── main.py           — 게임 진입점 (에이전트 생성 + 역할 배정)
+├── game.py           — 게임 로직 (밤/낮 단계 구현)
+├── structured_model.py — 역할별 Pydantic 출력 모델
+├── prompt.py         — 영어/한국어 프롬프트 (EnglishPrompts, ChinesePrompts)
+└── utils.py          — EchoAgent, majority_vote, Players 클래스
+```
 
 ---
 
-## 아키텍처
+## structured_model.py — 역할별 구조화 모델
+
+**실제 코드:**
 
 ```python
-# 역할별 시스템 프롬프트
-PROMPTS = {
-    "werewolf": "당신은 늑대인간입니다. 다른 늑대인간과 협력하여 마을 주민을 제거하세요...",
-    "villager": "당신은 마을 주민입니다. 토론을 통해 늑대인간을 찾아내세요...",
-    "seer": "당신은 예언자입니다. 매 밤 한 명의 진짜 역할을 확인할 수 있습니다...",
-    "witch": "당신은 마녀입니다. 독약과 해독약을 전략적으로 사용하세요...",
-    "hunter": "당신은 사냥꾼입니다. 제거될 때 한 명을 함께 제거할 수 있습니다...",
-}
-
-# 플레이어 에이전트 생성
-players = {
-    name: ReActAgent(
-        name=name,
-        sys_prompt=PROMPTS[role],
-        model=DashScopeChatModel(...),
+# examples/game/werewolves/structured_model.py
+class DiscussionModel(BaseModel):
+    """낮 토론 단계 출력 — 합의 여부"""
+    reach_agreement: bool = Field(
+        description="Whether you have reached an agreement or not"
     )
-    for name, role in assignments.items()
-}
+
+
+def get_vote_model(agents: list[AgentBase]) -> type[BaseModel]:
+    """에이전트 목록에서 동적으로 투표 모델 생성"""
+    class VoteModel(BaseModel):
+        vote: Literal[tuple(_.name for _ in agents)] = Field(  # type: ignore
+            description="The name of the player you want to vote for"
+        )
+    return VoteModel
+
+
+class WitchResurrectModel(BaseModel):
+    """마녀 부활 포션 사용 여부"""
+    resurrect: bool = Field(description="Whether you want to resurrect the player")
+
+
+def get_poison_model(agents: list[AgentBase]) -> type[BaseModel]:
+    """마녀 독 포션 모델 — 사용 여부 + 대상"""
+    class WitchPoisonModel(BaseModel):
+        poison: bool = Field(description="Do you want to use the poison potion")
+        name: Literal[tuple(_.name for _ in agents)] | None = Field(
+            description="The name of the player to poison, or None",
+            default=None,
+        )
+
+        @model_validator(mode="before")
+        def clear_name_if_no_poison(cls, values: dict) -> dict:
+            """독을 사용하지 않으면 name을 None으로 강제"""
+            if isinstance(values, dict) and not values.get("poison"):
+                values["name"] = None
+            return values
+
+    return WitchPoisonModel
+
+
+def get_seer_model(agents: list[AgentBase]) -> type[BaseModel]:
+    """예언자 조사 대상 선택"""
+    class SeerModel(BaseModel):
+        name: Literal[tuple(_.name for _ in agents)] = Field(
+            description="The name of the player you want to check"
+        )
+    return SeerModel
+
+
+def get_hunter_model(agents: list[AgentBase]) -> type[BaseModel]:
+    """사냥꾼 총격 여부 + 대상"""
+    class HunterModel(BaseModel):
+        shoot: bool = Field(description="Whether you want to use the shooting ability")
+        name: Literal[tuple(_.name for _ in agents)] | None = Field(
+            description="The name of the player to shoot, or None",
+            default=None,
+        )
+
+        @model_validator(mode="before")
+        def clear_name_if_no_shoot(cls, values: dict) -> dict:
+            if isinstance(values, dict) and not values.get("shoot"):
+                values["name"] = None
+            return values
+
+    return HunterModel
 ```
+
+**핵심 설계 패턴:**
+- `get_vote_model(players.current_alive)` — 살아있는 플레이어로 `Literal` 타입을 동적 생성 → 죽은 플레이어에게 투표 불가
+- `@model_validator` — 조건부 필드 검증 (독/총 미사용 시 대상 자동 None)
 
 ---
 
-## 게임 흐름 (상태 머신)
+## game.py — 게임 흐름
 
-```
-초기화 (역할 배분)
-  ↓
-밤 페이즈 (NIGHT)
-  ├─ 늑대인간 팀 비밀 투표 → 희생자 결정
-  ├─ 예언자 → 1명 역할 확인
-  └─ 마녀 → 독약/해독약 사용 결정
-  ↓
-낮 페이즈 (DAY)
-  ├─ 밤 결과 발표
-  ├─ 전체 토론 (MsgHub 브로드캐스트)
-  └─ 투표 → 추방 대상 결정
-  ↓
-승리 조건 확인
-  ├─ 늑대인간 수 ≥ 마을 주민 수 → 늑대인간 승리
-  └─ 늑대인간 전멸 → 마을 주민 승리
-  ↓
-(반복 또는 게임 종료)
-```
-
----
-
-## 구조화 출력 활용
+**실제 코드 (핵심 부분):**
 
 ```python
-class VoteOutput(BaseModel):
-    target: str           # 투표 대상 플레이어 이름
-    reason: str           # 투표 이유
+# examples/game/werewolves/game.py
+async def hunter_stage(hunter_agent: ReActAgent, players: Players) -> str | None:
+    """사냥꾼 단계 (밤에 죽거나 낮에 추방될 때 발동)"""
+    msg_hunter = await hunter_agent(
+        await moderator(Prompts.to_hunter.format(name=hunter_agent.name)),
+        structured_model=get_hunter_model(players.current_alive),
+    )
+    if msg_hunter.metadata.get("shoot"):
+        return msg_hunter.metadata.get("name", None)
+    return None
 
-class WitchDecision(BaseModel):
-    use_poison: bool
-    poison_target: str | None
-    use_antidote: bool
 
-# 각 플레이어의 행동을 검증된 구조로 수집
-vote = await player.reply(
-    discussion_msg,
-    structured_model=VoteOutput,
-)
+async def werewolves_game(agents: list[ReActAgent]) -> None:
+    """메인 게임 루프"""
+    assert len(agents) == 9, "The werewolf game needs exactly 9 players."
+
+    players = Players()
+    healing, poison = True, True  # 마녀 포션 상태
+    # ...
 ```
 
----
-
-## 세션 영속성
+**`EchoAgent` (utils.py):** 게임 진행자(moderator) 역할 — TTS 옵션도 포함
 
 ```python
-from agentscope.session import JSONSession
-
-session = JSONSession(save_dir="./game_saves/")
-
-# 게임 중단 후 이어서 플레이 가능
-await session.save_session_state(
-    session_id="game_001",
-    user_id="host",
-    **{name: agent for name, agent in players.items()},
-    game_state=game_state_module,
-)
+class EchoAgent(AgentBase):
+    """메시지를 그대로 에코하는 진행자 에이전트 (TTS 옵션 포함)"""
+    # tts_model=DashScopeTTSModel(...) 옵션으로 음성 진행 가능
 ```
 
 ---
 
-## AgentScope 활용 포인트
+## 게임 역할 구성 (9명)
 
-| 기능 | 활용 방식 |
-|------|----------|
-| `MsgHub` | 낮 페이즈 전체 토론 브로드캐스트 |
-| `ReActAgent` | 각 플레이어의 전략적 추론 |
-| 구조화 출력 | 투표/행동 결과의 정확한 파싱 |
-| `JSONSession` | 게임 상태 저장/복원 |
-| 역할별 프롬프트 | 각 역할의 고유한 행동 패턴 구현 |
+| 역할 | 수 | 구조화 모델 | 행동 |
+|------|-----|-----------|------|
+| 늑대인간 (Werewolf) | 3 | `get_vote_model()` | 밤에 희생자 선택 |
+| 마을 주민 (Villager) | 2 | `VoteModel` | 낮에 투표 |
+| 예언자 (Seer) | 1 | `get_seer_model()` | 밤에 한 명 정체 확인 |
+| 마녀 (Witch) | 1 | `WitchResurrectModel`, `get_poison_model()` | 부활/독 포션 |
+| 사냥꾼 (Hunter) | 1 | `get_hunter_model()` | 죽을 때 총격 |
+| 수호자 (Guard) | 1 | `get_vote_model()` | 밤에 한 명 보호 |
+
+---
+
+## MsgHub 활용 패턴
+
+```python
+# 늑대인간 밤 회의 — 늑대인간끼리만 소통
+async with MsgHub(participants=werewolves):
+    await sequential_pipeline(werewolves)
+
+# 낮 토론 — 모든 생존자
+async with MsgHub(participants=players.current_alive):
+    for _ in range(MAX_DISCUSSION_ROUND):
+        result = await fanout_pipeline(players.current_alive, enable_gather=False)
+        # DiscussionModel로 합의 여부 체크
+```
