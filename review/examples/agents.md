@@ -4,241 +4,272 @@
 
 ## 위치: `examples/agent/`
 
-8가지 에이전트 유형의 실제 구현 예제. 각 예제는 독립적으로 실행 가능하며 README를 포함한다.
-
 ---
 
 ## 1. react_agent — 기본 ReAct 에이전트
 
-**파일**: `main.py`, `README.md`
+**파일**: `main.py`
 
-**목적**: 툴을 사용하는 ReAct 에이전트의 기본 구현 예제.
+**실제 코드:**
 
 ```python
+# examples/agent/react_agent/main.py
 toolkit = Toolkit()
 toolkit.register_tool_function(execute_shell_command)
 toolkit.register_tool_function(execute_python_code)
 toolkit.register_tool_function(view_text_file)
 
 agent = ReActAgent(
-    name="assistant",
-    sys_prompt="...",
-    model=DashScopeChatModel(model_name="qwen-max"),
+    name="Friday",
+    sys_prompt="You are a helpful assistant named Friday.",
+    model=DashScopeChatModel(
+        api_key=os.environ.get("DASHSCOPE_API_KEY"),
+        model_name="qwen-max",
+        enable_thinking=False,
+        stream=True,
+    ),
     formatter=DashScopeChatFormatter(),
     toolkit=toolkit,
     memory=InMemoryMemory(),
 )
 
-# 대화 루프
+user = UserAgent("User")
+
+msg = None
 while True:
-    user_input = input("User: ")
-    msg = Msg(name="user", content=user_input, role="user")
-    response = await agent(msg)
+    msg = await user(msg)
+    if msg.get_text_content() == "exit":
+        break
+    msg = await agent(msg)
 ```
 
-**핵심 패턴**: 툴 등록 → ReAct 루프 → 스트리밍 응답
+**특징:**
+- 에이전트 이름: `Friday`
+- 내장 툴 3개: `execute_shell_command`, `execute_python_code`, `view_text_file`
+- `UserAgent`로 대화 루프 관리
+- `msg.get_text_content() == "exit"` 로 종료
 
 ---
 
-## 2. voice_agent — 음성 출력 에이전트
+## 2. browser_agent — 웹 브라우저 자동화
 
-**파일**: `main.py`, `README.md`
+**파일**: `browser_agent.py`, `main.py`
 
-**목적**: Qwen-Omni 모델을 사용하여 텍스트와 오디오를 동시에 생성하는 에이전트.
+`BrowserAgent`는 `ReActAgent`를 확장하며, Playwright MCP를 통해 실제 브라우저를 제어.
 
-```python
-agent = ReActAgent(
-    name="voice_assistant",
-    model=OpenAIChatModel(
-        model_name="qwen-omni-turbo",
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    ),
-    memory=InMemoryMemory(),
-)
-```
-
-**특이사항**: 오디오 출력 모드가 활성화되면 툴 호출이 제한될 수 있음.
-
----
-
-## 3. realtime_voice_agent — 실시간 음성 서버
-
-**파일**: `run_server.py`, `chatbot.html`
-
-**목적**: FastAPI + WebSocket으로 구성된 실시간 음성 대화 서버. 브라우저에서 접속 가능.
+**실제 코드:**
 
 ```python
-@app.websocket("/ws/{user_id}/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, ...):
-    await websocket.accept()
+# examples/agent/browser_agent/main.py
+class FinalResult(BaseModel):
+    result: str = Field(description="The final result to the initial user query")
 
-    # 에이전트 세션 생성 또는 복원
-    agent = RealtimeAgent(
-        name="assistant",
-        realtime_model=DashScopeRealtimeModel(...),  # 또는 Gemini, OpenAI
+
+async def main(start_url_param="https://www.google.com", max_iters_param=50):
+    toolkit = Toolkit()
+    browser_client = StdIOStatefulClient(
+        name="playwright-mcp",
+        command="npx",
+        args=["@playwright/mcp@latest"],
     )
 
-    # 클라이언트 이벤트 → 에이전트 → 오디오 응답
-    outgoing_queue = asyncio.Queue()
-    await agent.start(outgoing_queue)
+    await browser_client.connect()
+    await toolkit.register_mcp_client(browser_client)
+
+    agent = BrowserAgent(
+        name="Browser-Use Agent",
+        model=DashScopeChatModel(
+            api_key=os.environ.get("DASHSCOPE_API_KEY"),
+            model_name="qwen3-max",
+            stream=False,
+        ),
+        formatter=DashScopeChatFormatter(),
+        memory=InMemoryMemory(),
+        toolkit=toolkit,
+        max_iters=max_iters_param,
+        start_url=start_url_param,
+    )
+    user = UserAgent("User")
+
+    msg = None
+    while True:
+        msg = await user(msg)
+        if msg.get_text_content() == "exit":
+            break
+        msg = await agent(msg, structured_model=FinalResult)
+        await agent.memory.clear()  # 매 태스크 후 메모리 초기화
 ```
 
-**지원 모델**: `DashScopeRealtimeModel`, `GeminiRealtimeModel`, `OpenAIRealtimeModel`
+**`BrowserAgent` 클래스 특징:**
+- `ReActAgent`를 상속
+- `token_counter=OpenAITokenCounter("gpt-4o")` — 토큰 카운팅
+- `max_mem_length=20` — 메모리 최대 길이
+- `start_url` — 브라우저 초기 URL
+- 세 가지 전문 프롬프트: `pure_reasoning_prompt`, `observe_reasoning_prompt`, `task_decomposition_prompt`
+- 매 태스크 후 `agent.memory.clear()` 호출 — 브라우저 상태만 유지
 
-**아키텍처**:
-```
-브라우저 (chatbot.html)
-  ↕ WebSocket
-FastAPI 서버 (run_server.py)
-  ↕ 이벤트 큐
-RealtimeAgent
-  ↕ WebSocket
-LLM 실시간 API
+**실행 방법:**
+```bash
+python main.py --start-url https://www.google.com --max-iters 50
 ```
 
 ---
 
-## 4. browser_agent — 브라우저 자동화 에이전트
+## 3. deep_research_agent — 딥 리서치
 
-**파일**: `main.py`, `browser_agent.py`, `README.md`
+**파일**: `deep_research_agent.py`, `main.py`
 
-**목적**: Playwright MCP를 통해 웹 브라우저를 자동으로 조작하는 에이전트.
+`DeepResearchAgent`는 `ReActAgent`를 확장. Tavily 검색 MCP 클라이언트를 사용해 깊은 웹 리서치 수행.
+
+**실제 코드:**
 
 ```python
-mcp_client = StdIOStatefulClient(
-    name="playwright",
+# examples/agent/deep_research_agent/main.py
+tavily_search_client = StdIOStatefulClient(
+    name="tavily_mcp",
     command="npx",
-    args=["@playwright/mcp@latest"],
+    args=["-y", "tavily-mcp@latest"],
+    env={"TAVILY_API_KEY": os.getenv("TAVILY_API_KEY", "")},
 )
 
-class BrowserAgent(ReActAgent):
-    max_iterations: int = 20
+await tavily_search_client.connect()
+agent = DeepResearchAgent(
+    name="Friday",
+    sys_prompt="You are a helpful assistant named Friday.",
+    model=DashScopeChatModel(
+        api_key=os.environ.get("DASHSCOPE_API_KEY"),
+        model_name="qwen3-max",
+        enable_thinking=False,
+        stream=True,
+    ),
+    formatter=DashScopeChatFormatter(),
+    memory=InMemoryMemory(),
+    search_mcp_client=tavily_search_client,
+    tmp_file_storage_dir=agent_working_dir,
+    max_tool_results_words=10000,
+)
 
-    async def reply(self, msg: Msg, structured_model=None) -> Msg:
-        # URL 추출 → 브라우저 실행 → 결과 반환
-        ...
-
-await mcp_client.connect()
-toolkit = Toolkit()
-await toolkit.register_mcp_client(mcp_client)
+msg = Msg("Bob", content=user_query, role="user")
+result = await agent(msg)
 ```
 
-**핵심 패턴**: MCP를 통한 외부 툴(Playwright) 연동, 구조화 출력(Pydantic)으로 결과 검증
+**`DeepResearchAgent` 파라미터:**
+- `search_mcp_client` — Tavily MCP 클라이언트 (필수)
+- `max_iters=30` — 최대 반복 횟수
+- `max_depth=3` — 재귀 리서치 최대 깊이
+- `max_tool_results_words=10000` — 툴 결과 최대 단어 수
+- `tmp_file_storage_dir` — 임시 파일 저장 경로
+
+**내부 동작:** 질문을 서브쿼리로 분해 → 각 서브쿼리에 대해 Tavily 검색 → 결과를 파일로 저장 → 최종 종합 보고서 생성
 
 ---
 
-## 5. deep_research_agent — 딥리서치 에이전트
+## 4. a2a_agent — 에이전트 간 통신
 
-**파일**: `main.py`, 커스텀 `DeepResearchAgent` 클래스
+**파일**: `main.py`, `setup_a2a_server.py`, `agent_card.py`
 
-**목적**: Tavily 검색 MCP와 연동하여 심층 리서치를 수행하는 에이전트.
+**파일 구조:**
+- `setup_a2a_server.py` — A2A 서버 구동 (StarlettApplication)
+- `agent_card.py` — AgentCard 정의 (이름, URL, capabilities)
+- `main.py` — A2AAgent 클라이언트 예제
+
+**A2A 서버 설정:**
+```python
+# setup_a2a_server.py
+from agentscope.a2a import A2AStarletteApplication
+
+app = A2AStarletteApplication(
+    agent=react_agent,
+    agent_card=agent_card,
+)
+# uvicorn으로 실행
+```
+
+---
+
+## 5. a2ui_agent — UI 생성 에이전트
+
+**파일**: `samples/general_agent/`
+
+에이전트 응답에 구조화된 UI 컴포넌트를 포함. `---a2ui_JSON---` 구분자로 UI JSON 전달.
+
+**UI 템플릿 예시** (`skills/A2UI_response_generator/UI_templete_examples/`):
+- `contact_form.py` — 연락처 폼
+- `email_compose_form.py` — 이메일 작성 폼
+- `selection_card.py` — 선택 카드
+- `item_detail_card_with_image.py` — 이미지 포함 상세 카드
+- `booking_form.py` — 예약 폼
+
+---
+
+## 6. meta_planner_agent — 메타 플래너
+
+**파일**: `main.py`, `tool.py`
+
+복잡한 태스크를 하위 태스크로 분해하고, 각 하위 태스크를 처리할 worker 에이전트를 동적 생성.
+
+**툴:**
+```python
+# tool.py
+async def create_worker(
+    description: str,
+    system_prompt: str,
+) -> str:
+    """Create a worker agent to solve a specific task."""
+    worker = ReActAgent(
+        name="worker",
+        sys_prompt=system_prompt,
+        model=...,
+        toolkit=Toolkit(),
+    )
+    result = await worker(Msg("user", description, "user"))
+    return result.get_text_content()
+```
+
+---
+
+## 7. realtime_voice_agent — 실시간 음성
+
+**파일**: `run_server.py`
+
+WebSocket 기반 실시간 양방향 음성 대화. `RealtimeAgent` 사용.
 
 ```python
-class DeepResearchAgent(ReActAgent):
-    # 확장된 컨텍스트 처리
-    # 중간 결과 파일 저장
-    # Thinking 모드 활성화
-    pass
+# run_server.py (개요)
+from agentscope.agent import RealtimeAgent
+from agentscope.model import DashScopeRealtimeModel
 
-search_client = StdIOStatefulClient(
-    name="tavily",
-    command="npx",
-    args=["tavily-mcp@latest"],
+agent = RealtimeAgent(
+    name="assistant",
+    model=DashScopeRealtimeModel(
+        model_name="qwen-omni-turbo-realtime",
+        api_key=os.environ["DASHSCOPE_API_KEY"],
+    ),
 )
+# FastAPI + WebSocket으로 클라이언트와 연결
 ```
-
-**특징**:
-- 긴 컨텍스트를 처리하기 위한 토큰 제한 확장
-- 중간 연구 결과를 파일로 저장
-- `thinking` 블록 지원 (Anthropic Claude 스타일)
 
 ---
 
-## 6. meta_planner_agent — 계층적 플래닝 에이전트
+## 8. voice_agent — TTS 음성 에이전트
 
-**파일**: `main.py`, `tool.py`, `README.md`
+**파일**: `main.py`
 
-**목적**: 복잡한 태스크를 서브태스크로 분해하고, 동적으로 워커 에이전트를 생성하여 실행하는 메타 플래너.
+텍스트 응답을 TTS로 변환하여 음성 출력.
 
 ```python
-# 플래너는 태스크를 직접 해결하지 않고 계획만 수립
-sys_prompt = """
-당신은 메타 플래너입니다.
-- 태스크를 분석하여 서브태스크로 분해하세요.
-- 각 서브태스크를 위한 워커 에이전트를 생성하세요.
-- 서브태스크를 직접 해결하지 마세요.
-"""
+from agentscope.tts import DashScopeTTSModel
 
-planner = ReActAgent(
-    name="MetaPlanner",
-    sys_prompt=sys_prompt,
-    toolkit=toolkit,  # create_worker, PlanNotebook 툴 포함
-    plan_notebook=PlanNotebook(),
-)
-```
-
-**핵심 패턴**:
-```
-MetaPlanner.reply(태스크)
-  → PlanNotebook.create_plan() → [SubTask1, SubTask2, ...]
-  → create_worker(SubTask1) → WorkerAgent1.reply()
-  → create_worker(SubTask2) → WorkerAgent2.reply()
-  → 결과 통합
-```
-
----
-
-## 7. a2a_agent — Agent-to-Agent 클라이언트
-
-**파일**: `main.py`, `agent_card.py`, `setup_a2a_server.py`, `README.md`
-
-**목적**: A2A 프로토콜을 통해 원격 에이전트 서버와 통신하는 클라이언트 에이전트.
-
-```python
-agent = A2AAgent(
-    name="client",
-    resolver=FileAgentCardResolver("./agent_card.json"),
+tts = DashScopeTTSModel(
+    model_name="qwen3-tts-flash",
+    api_key=os.environ["DASHSCOPE_API_KEY"],
+    voice="Cherry",
+    stream=True,
 )
 
-# 원격 에이전트에 태스크 전송
-response = await agent.reply(
-    Msg(name="user", content="파이썬으로 피보나치 수열을 구현해줘", role="user")
+agent = ReActAgent(
+    name="voice_assistant",
+    tts_model=tts,
+    ...
 )
 ```
-
-**제한사항**: 현재 채팅 전용, 스트리밍/구조화 출력 미지원
-
----
-
-## 8. a2ui_agent — UI 생성 에이전트
-
-**파일**: `__main__.py`, `skill/` 디렉토리
-
-**목적**: 에이전트가 텍스트 대신 구조화된 UI 컴포넌트(폼, 카드, 리스트)로 응답하는 패턴.
-
-```python
-# 에이전트가 UI 스키마를 따르는 응답 생성
-class ContactForm(BaseModel):
-    name: str
-    email: str
-    message: str
-
-response = await agent(msg, structured_model=ContactForm)
-```
-
-**지원 UI 컴포넌트**: 연락처 폼, 검색 필터, 선택 카드, 이미지 갤러리, 예약 폼
-
----
-
-## 예제별 사용 모듈 매핑
-
-| 예제 | Agent | Model | Tool | Memory | MCP | Special |
-|------|-------|-------|------|--------|-----|---------|
-| react_agent | ReActAgent | DashScope | ✓ | InMemory | — | — |
-| voice_agent | ReActAgent | OpenAI | — | InMemory | — | Audio |
-| realtime_voice | RealtimeAgent | Realtime | — | — | — | WebSocket |
-| browser_agent | ReActAgent | Any | ✓ | — | Playwright | Pydantic |
-| deep_research | ReActAgent | DashScope | ✓ | — | Tavily | Thinking |
-| meta_planner | ReActAgent | Any | ✓ | — | — | PlanNotebook |
-| a2a_agent | A2AAgent | — | — | — | — | A2A Protocol |
-| a2ui_agent | Custom | Any | — | — | — | UI Schema |

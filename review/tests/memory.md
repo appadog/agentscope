@@ -4,10 +4,10 @@
 
 ## 파일 목록 (4개)
 
-| 파일 | 테스트 대상 |
-|------|-----------|
-| `memory_test.py` | InMemoryMemory, SQLAlchemyMemory, RedisMemory |
-| `memory_compression_test.py` | 메모리 압축 파이프라인 |
+| 파일 | 테스트 클래스 |
+|------|-------------|
+| `memory_test.py` | `ShortTermMemoryTest` |
+| `memory_compression_test.py` | `MemoryCompressionTest` |
 | `memory_reme_test.py` | ReMeShortTermMemory |
 | `mem0_utils_test.py` | mem0ai 통합 유틸리티 |
 
@@ -15,159 +15,198 @@
 
 ## memory_test.py
 
-세 가지 백엔드의 공통 동작을 `_basic_tests` 헬퍼 메서드로 통합 검증.
+**테스트 클래스:** `ShortTermMemoryTest(IsolatedAsyncioTestCase)`
+
+세 가지 백엔드(`InMemoryMemory`, `AsyncSQLAlchemyMemory`, `RedisMemory`)에 동일한 테스트를 적용하는 헬퍼 메서드 구조.
+
+**`_basic_tests()` — 공통 기본 동작:**
 
 ```python
-class TestMemory(IsolatedAsyncioTestCase):
+async def _basic_tests(self, memory: MemoryBase):
+    msgs = [
+        Msg("user", "0", "user"),
+        Msg("assistant", "2", "assistant"),
+        Msg("system", "3", "system"),
+    ]
+    # ID 수동 설정 (삭제 테스트용)
+    for i, msg in enumerate(msgs):
+        msg.id = str(i)
 
-    async def _basic_tests(self, memory: MemoryBase):
-        """모든 백엔드에 공통으로 적용되는 기본 테스트"""
+    # 배치 추가
+    await memory.add(msgs)
+    self.assertEqual(await memory.size(), 3)
 
-        # 메시지 추가
-        msg1 = Msg(name="user", content="첫 번째 메시지", role="user")
-        msg2 = Msg(name="assistant", content="응답", role="assistant")
-        await memory.add([msg1, msg2])
+    # 전체 조회
+    retrieved = await memory.get_memory()
+    self.assertEqual(len(retrieved), 3)
 
-        # 크기 확인
-        size = await memory.size()
-        self.assertEqual(size, 2)
+    # ID 기반 삭제
+    await memory.delete([msgs[0].id])
+    self.assertEqual(await memory.size(), 2)
 
-        # 전체 조회
-        msgs = await memory.get_memory()
-        self.assertEqual(len(msgs), 2)
+    # 전체 초기화
+    await memory.clear()
+    self.assertEqual(await memory.size(), 0)
+```
 
-        # 특정 메시지 삭제
-        await memory.delete([msg1.id])
-        self.assertEqual(await memory.size(), 1)
+**`_mark_tests()` — 마크 기반 필터링:**
 
-        # 전체 초기화
-        await memory.clear()
-        self.assertEqual(await memory.size(), 0)
+```python
+async def _mark_tests(self, memory: MemoryBase):
+    msg1 = Msg("user", "task1 메시지", "user")
+    msg2 = Msg("user", "task2 메시지", "user")
+    msg3 = Msg("user", "마크 없는 메시지", "user")
 
-    async def test_in_memory_backend(self):
-        memory = InMemoryMemory()
-        await self._basic_tests(memory)
+    await memory.add([msg1], marks=["task_1"])
+    await memory.add([msg2], marks=["task_2"])
+    await memory.add([msg3])
 
-    async def test_sqlalchemy_backend(self):
-        memory = AsyncSQLAlchemyMemory(
-            db_url="sqlite+aiosqlite:///:memory:"
-        )
-        await self._basic_tests(memory)
+    # 특정 마크만 조회
+    result = await memory.get_memory(mark="task_1")
+    self.assertEqual(len(result), 1)
+    self.assertEqual(result[0].content, "task1 메시지")
 
-    async def test_redis_backend(self):
-        # fakeredis로 실제 Redis 없이 테스트
-        import fakeredis.aioredis
-        redis = fakeredis.aioredis.FakeRedis()
-        memory = RedisMemory(redis_client=redis)
-        await self._basic_tests(memory)
+    # 특정 마크 제외 조회
+    result = await memory.get_memory(exclude_mark="task_2")
+    self.assertEqual(len(result), 2)  # msg1, msg3
 
-    async def test_mark_filtering(self):
-        """마크 기반 선택적 조회"""
-        memory = InMemoryMemory()
+    # 마크 업데이트
+    await memory.update_messages_mark(new_mark="updated", old_mark="task_1")
+    result = await memory.get_memory(mark="updated")
+    self.assertEqual(len(result), 1)
+```
 
-        await memory.add([msg1], marks=["task_1"])
-        await memory.add([msg2], marks=["task_2"])
-        await memory.add([msg3])  # 마크 없음
+**`_multi_tenant_tests()` — 멀티 테넌트 격리:**
 
-        # task_1 마크만 조회
-        result = await memory.get_memory(mark="task_1")
-        self.assertEqual(len(result), 1)
+```python
+async def _multi_tenant_tests(self, memory: MemoryBase):
+    """서로 다른 tenant_id 간 데이터 격리 검증"""
+    await memory.add([msg_a], tenant_id="user_A")
+    await memory.add([msg_b], tenant_id="user_B")
 
-        # task_2 마크 제외 조회
-        result = await memory.get_memory(exclude_mark="task_2")
-        self.assertEqual(len(result), 2)  # msg1, msg3
+    result_a = await memory.get_memory(tenant_id="user_A")
+    result_b = await memory.get_memory(tenant_id="user_B")
 
-    async def test_compressed_summary(self):
-        """압축 요약 prepend 동작"""
-        memory = InMemoryMemory()
-        memory._compressed_summary = "이전 대화 요약..."
+    self.assertEqual(len(result_a), 1)
+    self.assertEqual(len(result_b), 1)
+    self.assertNotEqual(result_a[0].id, result_b[0].id)
+```
 
-        msgs = await memory.get_memory(prepend_summary=True)
-        # 첫 번째 메시지가 요약이어야 함
-        self.assertEqual(msgs[0].content, "이전 대화 요약...")
+**백엔드별 테스트:**
 
-    async def test_update_mark(self):
-        """메시지 마크 업데이트"""
-        await memory.add([msg], marks=["old_mark"])
-        await memory.update_messages_mark(
-            new_mark="new_mark",
-            old_mark="old_mark",
-        )
-        result = await memory.get_memory(mark="new_mark")
-        self.assertEqual(len(result), 1)
+```python
+async def test_in_memory_backend(self):
+    memory = InMemoryMemory()
+    await self._basic_tests(memory)
+    await self._mark_tests(memory)
+
+async def test_sqlalchemy_backend(self):
+    memory = AsyncSQLAlchemyMemory(db_url="sqlite+aiosqlite:///:memory:")
+    await self._basic_tests(memory)
+    await self._mark_tests(memory)
+
+async def test_redis_backend(self):
+    import fakeredis.aioredis
+    redis = fakeredis.aioredis.FakeRedis()
+    memory = RedisMemory(redis_client=redis, session_id="test_session")
+    await self._basic_tests(memory)
 ```
 
 ---
 
 ## memory_compression_test.py
 
-메모리 압축 파이프라인 검증.
+**테스트 클래스:** `MemoryCompressionTest(IsolatedAsyncioTestCase)`
+
+**목 클래스:**
 
 ```python
-class TestMemoryCompression(IsolatedAsyncioTestCase):
+class MockChatModel(ChatModelBase):
+    """압축 요약 응답을 반환하는 목 모델"""
+    def __init__(self):
+        super().__init__("mock_model", stream=False)
+        self.received_messages = []
+        self.call_count = 0
 
-    async def test_compression_triggered(self):
-        """토큰 임계값 초과 시 압축 자동 실행"""
-        mock_model = MockChatModel(
-            summary_response="대화 요약: 사용자가 파이썬 질문을 했음."
+    async def __call__(self, messages: list[dict], **kwargs) -> ChatResponse:
+        self.received_messages = messages
+        self.call_count += 1
+        return ChatResponse(
+            content=[TextBlock(type="text", text="압축된 대화 요약")]
         )
 
-        memory = InMemoryMemory()
-        config = CompressionConfig(
-            trigger_threshold=100,  # 100 토큰 초과 시 압축
-            keep_recent=2,          # 최근 2개 메시지 보존
-        )
+class MockFormatter(FormatterBase):
+    """단순 메시지 → dict 변환 포매터"""
+    async def format(self, msgs, **kwargs) -> list[dict]:
+        return [{"role": m.role, "content": str(m.content)} for m in msgs]
 
-        # 100 토큰 이상의 메시지들 추가
-        for i in range(10):
-            await memory.add([
-                Msg(name="user", content=f"긴 메시지 {i} " * 20, role="user")
-            ])
-
-        await memory.compress(model=mock_model, config=config)
-
-        # 압축 후 최근 2개만 남아야 함
-        msgs = await memory.get_memory(prepend_summary=False)
-        self.assertEqual(len(msgs), 2)
-
-        # 요약이 저장되어 있어야 함
-        self.assertIsNotNone(memory._compressed_summary)
+    def get_tool_schemas(self, toolkit=None):
+        return []
 ```
 
----
-
-## memory_reme_test.py
-
-ReMe 단기 메모리 검증.
+**임계값 이하 — 압축 미실행:**
 
 ```python
-async def test_reme_add_and_retrieve(self):
-    """ReME 메모리의 구조화된 저장 및 검색"""
-    memory = ReMeShortTermMemory(
-        model=MockChatModel(...),
-        max_tokens=500,
+async def test_no_compression_below_threshold(self):
+    agent = ReActAgent(
+        name="test",
+        model=MockChatModel(),
+        formatter=MockFormatter(),
+        memory=InMemoryMemory(),
+        compression_config=ReActAgent.CompressionConfig(
+            enable=True,
+            trigger_threshold=10000,  # 높은 임계값
+            agent_token_counter=CharTokenCounter(),
+            keep_recent=1,
+        ),
     )
 
-    await memory.add([
-        Msg(name="user", content="내 이름은 김철수야", role="user"),
-        Msg(name="assistant", content="알겠습니다, 김철수님!", role="assistant"),
-    ])
+    msg = Msg(name="user", content="짧은 메시지", role="user")
+    await agent.reply(msg)
 
-    # 개인 정보 검색
-    retrieved = await memory.get_memory()
-    self.assertIn("김철수", str(retrieved))
+    # 모델이 압축 요청을 받지 않았어야 함 (reply 1회만)
+    self.assertEqual(agent._model.call_count, 1)
+```
+
+**임계값 초과 — 압축 실행:**
+
+```python
+async def test_compression_above_threshold(self):
+    agent = ReActAgent(
+        name="test",
+        model=MockChatModel(),
+        formatter=MockFormatter(),
+        memory=InMemoryMemory(),
+        compression_config=ReActAgent.CompressionConfig(
+            enable=True,
+            trigger_threshold=10,   # 낮은 임계값 (10자)
+            agent_token_counter=CharTokenCounter(),
+            keep_recent=1,
+        ),
+    )
+
+    # 임계값을 초과하는 긴 메시지
+    msg = Msg(name="user", content="매우 긴 메시지 " * 100, role="user")
+    await agent.reply(msg)
+
+    # 모델이 압축 요청을 받아야 함
+    self.assertGreater(agent._model.call_count, 1)
+    # 메모리에 요약이 저장되어 있어야 함
+    self.assertIsNotNone(agent.memory._compressed_summary)
 ```
 
 ---
 
 ## 검증 항목 요약
 
-| 항목 | InMemory | SQL | Redis | ReMe | mem0 |
-|------|---------|-----|-------|------|------|
-| add/delete/clear | ✓ | ✓ | ✓ | ✓ | — |
-| size() | ✓ | ✓ | ✓ | ✓ | — |
-| get_memory() | ✓ | ✓ | ✓ | ✓ | — |
-| 마크 필터링 | ✓ | ✓ | ✓ | — | — |
-| 압축 트리거 | ✓ | — | — | ✓ | — |
-| 요약 prepend | ✓ | ✓ | ✓ | — | — |
-| 세션 격리 | ✓ | ✓ | ✓ | — | — |
+| 항목 | InMemory | SQL | Redis | Compression |
+|------|---------|-----|-------|-------------|
+| add/delete/clear | ✓ | ✓ | ✓ | — |
+| size() | ✓ | ✓ | ✓ | — |
+| get_memory() | ✓ | ✓ | ✓ | — |
+| 마크 필터링 | ✓ | ✓ | — | — |
+| 마크 업데이트 | ✓ | ✓ | — | — |
+| 멀티 테넌트 격리 | ✓ | ✓ | ✓ | — |
+| 압축 임계값 미트리거 | — | — | — | ✓ |
+| 압축 실행 및 요약 저장 | — | — | — | ✓ |
+| keep_recent 보존 | — | — | — | ✓ |

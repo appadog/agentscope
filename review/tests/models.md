@@ -4,131 +4,212 @@
 
 ## 파일 목록 (5개)
 
-| 파일 | 테스트 대상 |
-|------|-----------|
-| `model_openai_test.py` | OpenAIChatModel |
-| `model_anthropic_test.py` | AnthropicChatModel |
-| `model_gemini_test.py` | GeminiChatModel |
-| `model_dashscope_test.py` | DashScopeChatModel |
-| `model_ollama_test.py` | OllamaChatModel |
-
----
-
-## 공통 테스트 패턴
-
-```python
-class TestOpenAIChatModel(IsolatedAsyncioTestCase):
-
-    async def test_basic_call(self):
-        """기본 API 호출 및 응답 파싱"""
-        with patch("openai.AsyncOpenAI") as MockClient:
-            mock = AsyncMock()
-            MockClient.return_value = mock
-
-            # 목 응답 설정
-            mock.chat.completions.create.return_value = build_mock_response(
-                text="안녕하세요"
-            )
-
-            model = OpenAIChatModel(model_name="gpt-4o-mini")
-            response = await model(
-                messages=[{"role": "user", "content": "hello"}]
-            )
-
-            self.assertIsInstance(response, ChatResponse)
-            self.assertEqual(response.content[0].text, "안녕하세요")
-
-    async def test_streaming_mode(self):
-        """스트리밍 응답 청크 처리"""
-        async def mock_stream():
-            for text in ["안녕", "하세", "요"]:
-                yield build_stream_chunk(text=text)
-
-        mock.chat.completions.create.return_value = mock_stream()
-
-        chunks = []
-        async for chunk in model(messages, stream=True):
-            chunks.append(chunk)
-
-        full_text = "".join(c.content[0].text for c in chunks)
-        self.assertEqual(full_text, "안녕하세요")
-```
+| 파일 | 테스트 클래스 |
+|------|-------------|
+| `model_openai_test.py` | `TestOpenAIChatModel` |
+| `model_anthropic_test.py` | `TestAnthropicChatModel` |
+| `model_gemini_test.py` | `TestGeminiChatModel` |
+| `model_dashscope_test.py` | `TestDashScopeChatModel` |
+| `model_ollama_test.py` | `TestOllamaChatModel` |
 
 ---
 
 ## model_openai_test.py
 
+**테스트 클래스:** `TestOpenAIChatModel(IsolatedAsyncioTestCase)`
+
+**목 응답 빌더:**
+
 ```python
-class TestOpenAIChatModel(IsolatedAsyncioTestCase):
+def _create_mock_response(self, text="Hello") -> MagicMock:
+    """기본 텍스트 응답 mock"""
+    mock = MagicMock()
+    mock.choices = [MagicMock()]
+    mock.choices[0].message.content = text
+    mock.choices[0].message.tool_calls = None
+    mock.usage.prompt_tokens = 10
+    mock.usage.completion_tokens = 5
+    return mock
 
-    async def test_custom_params(self):
-        """커스텀 파라미터 전달 검증"""
-        model = OpenAIChatModel(
-            model_name="gpt-4o",
-            temperature=0.7,
-            max_tokens=1000,
-        )
-        # 파라미터가 API 호출에 포함되는지 검증
-        ...
+def _create_mock_response_with_tools(self, tool_name, tool_args) -> MagicMock:
+    """툴 호출 응답 mock"""
+    ...
 
-    async def test_structured_output(self):
-        """response_format으로 JSON 스키마 강제"""
-        class OutputSchema(BaseModel):
-            answer: str
-            confidence: float
+def _create_mock_response_with_reasoning(self, thinking, text) -> MagicMock:
+    """thinking 블록 포함 응답 mock"""
+    ...
 
-        model = OpenAIChatModel(
-            model_name="gpt-4o-mini",
-        )
-        response = await model(
-            messages,
-            response_format=OutputSchema,
-        )
-        # JSON 응답 파싱 검증
-        ...
+def _create_stream_mock(self, chunks: list[str]):
+    """스트리밍 응답 async iterator mock"""
+    async def mock_stream():
+        for text in chunks:
+            chunk = MagicMock()
+            chunk.choices[0].delta.content = text
+            chunk.choices[0].delta.tool_calls = None
+            yield chunk
+    return mock_stream()
+```
 
-    async def test_reasoning_effort(self):
-        """o1/o3 모델 reasoning_effort 파라미터"""
-        model = OpenAIChatModel(model_name="o1-mini")
-        response = await model(
-            messages,
-            reasoning_effort="high",
-        )
-        # ThinkingBlock이 응답에 포함되는지 검증
-        ...
+**테스트 메서드:**
 
-    async def test_tool_call_response(self):
-        """모델이 tool_calls를 반환할 때 ToolUseBlock 변환"""
-        mock_response = build_tool_call_response(
-            tool_name="search",
-            tool_args={"query": "파이썬"},
-        )
-        response = await model(messages)
-        self.assertIsInstance(response.content[0], ToolUseBlock)
+| 메서드 | 검증 내용 |
+|--------|----------|
+| `test_init_default_params()` | 기본 초기화 (AsyncOpenAI mock) |
+| `test_init_with_custom_params()` | temperature, max_tokens, organization |
+| `test_call_with_regular_model()` | 기본 텍스트 응답 파싱 |
+| `test_call_with_tools_integration()` | ToolUseBlock 생성 검증 |
+| `test_call_with_reasoning_effort()` | o3-mini의 reasoning_effort 파라미터 |
+| `test_call_with_structured_model_integration()` | Pydantic `.parse()` API |
+| `test_streaming_response_processing()` | 스트림 청크 집계 |
+| `test_streaming_response_with_none_delta()` | None delta 처리 |
+
+**스트리밍 테스트 패턴:**
+
+```python
+async def test_streaming_response_processing(self):
+    model = OpenAIChatModel(model_name="gpt-4o", stream=True, api_key="test")
+
+    with patch.object(model._client.chat.completions, "create") as mock_create:
+        mock_create.return_value = self._create_stream_mock(["Hello", " World"])
+
+        response = await model(messages=[{"role": "user", "content": "Hi"}])
+
+    self.assertIsInstance(response, ChatResponse)
+    self.assertEqual(response.content[0].text, "Hello World")
 ```
 
 ---
 
 ## model_anthropic_test.py
 
+**테스트 클래스:** `TestAnthropicChatModel(IsolatedAsyncioTestCase)`
+
+**목 클래스:**
+
 ```python
-async def test_extended_thinking(self):
-    """Claude의 extended thinking 응답 처리"""
-    mock_response = build_anthropic_response(
-        thinking="이 문제는...",
-        text="결론적으로...",
-    )
-    response = await model(messages)
+class AnthropicMessageMock:
+    """Anthropic API 응답 메시지 mock"""
+    def __init__(self, content_blocks, usage=None):
+        self.content = content_blocks
+        self.usage = usage or AnthropicUsageMock(input_tokens=50, output_tokens=20)
 
-    # ThinkingBlock + TextBlock 순서 검증
-    self.assertIsInstance(response.content[0], ThinkingBlock)
-    self.assertIsInstance(response.content[1], TextBlock)
+class AnthropicContentBlockMock:
+    """Anthropic 콘텐츠 블록 (text, tool_use, thinking)"""
+    def __init__(self, type, **kwargs):
+        self.type = type
+        for k, v in kwargs.items():
+            setattr(self, k, v)
 
-async def test_usage_tracking(self):
-    """토큰 사용량 정확히 파싱되는지 검증"""
-    response = await model(messages)
-    self.assertEqual(response.usage.input_tokens, 50)
-    self.assertEqual(response.usage.output_tokens, 100)
+class AnthropicEventMock:
+    """스트리밍 이벤트 mock"""
+    def __init__(self, type, **kwargs):
+        self.type = type
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+```
+
+**테스트 메서드:**
+
+| 메서드 | 검증 내용 |
+|--------|----------|
+| `test_init_default_params()` | 기본 max_tokens=2048, stream=True |
+| `test_init_with_custom_params()` | thinking config, 커스텀 파라미터 |
+| `test_call_with_regular_messages()` | 기본 메시지 처리 |
+| `test_call_with_system_message()` | system 메시지 분리 |
+| `test_call_with_thinking_enabled()` | ThinkingBlock 응답 파싱 |
+| `test_call_with_tools_integration()` | 툴 정의 포맷 및 ToolUseBlock 파싱 |
+| `test_streaming_response_processing()` | 이벤트 기반 스트리밍 |
+| `test_generate_kwargs_integration()` | temperature, top_p, top_k |
+| `test_call_with_structured_model_integration()` | 구조화 출력 (툴 강제) |
+
+**스트리밍 이벤트 순서:**
+
+```python
+events = [
+    AnthropicEventMock("message_start", message=AnthropicMessageMock([])),
+    AnthropicEventMock("content_block_start", index=0, content_block=text_block),
+    AnthropicEventMock("content_block_delta", index=0, delta=TextDeltaMock("Hello")),
+    AnthropicEventMock("content_block_delta", index=0, delta=TextDeltaMock(" World")),
+    AnthropicEventMock("content_block_stop", index=0),
+    AnthropicEventMock("message_delta", usage=UsageMock(output_tokens=10)),
+    AnthropicEventMock("message_stop"),
+]
+```
+
+---
+
+## model_gemini_test.py
+
+**테스트 클래스:** `TestGeminiChatModel(IsolatedAsyncioTestCase)`
+
+**목 클래스:**
+
+```python
+class GeminiResponseMock:
+    """Gemini API 응답 mock"""
+    def __init__(self, candidates, usage=None):
+        self.candidates = candidates
+        self.usage_metadata = usage or GeminiUsageMock(
+            prompt_token_count=10,
+            candidates_token_count=5,
+        )
+
+class GeminiFunctionCallMock:
+    def __init__(self, id, name, args):
+        self.id = id
+        self.name = name
+        self.args = args
+
+class GeminiPartMock:
+    def __init__(self, text=None, function_call=None, thought=None):
+        self.text = text
+        self.function_call = function_call
+        self.thought = thought
+
+class GeminiCandidateMock:
+    def __init__(self, parts):
+        self.content = MagicMock()
+        self.content.parts = parts
+```
+
+**테스트 메서드:**
+
+| 메서드 | 검증 내용 |
+|--------|----------|
+| `test_init_default_params()` | 기본 초기화 |
+| `test_init_with_custom_params()` | thinking config, 커스텀 파라미터 |
+| `test_call_with_regular_model()` | 기본 텍스트 생성 |
+| `test_call_with_tools_integration()` | function_calling_config AUTO 모드 |
+| `test_call_with_thinking_enabled()` | `thought=True` 파트 → ThinkingBlock |
+| `test_call_with_structured_model_integration()` | JSON 스키마 강제 모드 |
+| `test_streaming_response_processing()` | async generator 스트리밍 |
+| `test_format_tools_with_nested_schema()` | `$ref` JSON 스키마 인라인 해결 |
+
+**비동기 제너레이터 헬퍼:**
+
+```python
+async def _create_async_generator(self, items: list):
+    """테스트용 async generator"""
+    for item in items:
+        yield item
+```
+
+**중첩 스키마 `$ref` 해결 테스트:**
+
+```python
+async def test_format_tools_with_nested_schema(self):
+    """Pydantic 모델의 $ref 참조를 인라인으로 전개하는지 검증"""
+    class Inner(BaseModel):
+        value: int
+
+    class Outer(BaseModel):
+        inner: Inner
+        name: str
+
+    # $ref 없이 완전히 인라인 처리된 스키마로 변환되어야 함
+    tools = model._format_tools([tool_with_pydantic_schema])
+    schema = tools[0]["function_declarations"][0]["parameters"]
+    self.assertNotIn("$ref", str(schema))
 ```
 
 ---
@@ -139,8 +220,11 @@ async def test_usage_tracking(self):
 |------|--------|-----------|--------|-----------|--------|
 | 기본 텍스트 응답 | ✓ | ✓ | ✓ | ✓ | ✓ |
 | 스트리밍 응답 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| None delta 처리 | ✓ | — | — | — | — |
 | 툴 호출 응답 파싱 | ✓ | ✓ | ✓ | ✓ | ✓ |
-| 토큰 사용량 추적 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 토큰 사용량 추적 | ✓ | ✓ | ✓ | ✓ | — |
+| ThinkingBlock 파싱 | ✓ | ✓ | ✓ | — | — |
 | 구조화 출력 | ✓ | ✓ | ✓ | — | — |
+| $ref 스키마 해결 | — | — | ✓ | — | — |
+| system 메시지 분리 | — | ✓ | — | — | — |
 | 커스텀 파라미터 | ✓ | ✓ | ✓ | ✓ | ✓ |
-| 에러 처리 | ✓ | ✓ | ✓ | ✓ | ✓ |

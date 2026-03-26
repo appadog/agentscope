@@ -4,318 +4,368 @@
 
 ## 위치: `examples/functionality/`
 
-AgentScope의 개별 기능을 시연하는 13개 예제 모음.
-
 ---
 
 ## 1. rag — 검색 증강 생성
 
 **파일**: `basic_usage.py`, `react_agent_integration.py`, `agentic_usage.py`, `multimodal_rag.py`
 
-### 기본 사용
+### basic_usage.py — 실제 코드
 
 ```python
-# 임베딩 모델 + Qdrant 벡터 DB 설정
-embedding_model = DashScopeTextEmbedding(model_name="text-embedding-v3")
-store = QdrantStore(collection_name="docs", embedding_dim=1024)
+# examples/functionality/rag/basic_usage.py
+reader = TextReader(chunk_size=1024)
+pdf_reader = PDFReader(chunk_size=1024, split_by="sentence")
 
+# 텍스트 직접 파싱
+documents = await reader(
+    text="I'm Tony Stank, my password is 123456. My best friend is James Rhodes.",
+)
+
+# PDF 파일 파싱
+pdf_documents = await pdf_reader(pdf_path=pdf_path)
+
+# Qdrant 인메모리 + DashScope 임베딩
 knowledge = SimpleKnowledge(
-    embedding_store=store,
-    embedding_model=embedding_model,
+    embedding_store=QdrantStore(
+        location=":memory:",
+        collection_name="test_collection",
+        dimensions=1024,
+    ),
+    embedding_model=DashScopeTextEmbedding(
+        api_key=os.environ["DASHSCOPE_API_KEY"],
+        model_name="text-embedding-v4",
+    ),
 )
 
-# 문서 추가
-reader = TextReader(chunk_size=512)
-docs = await reader("./documents/")
-await knowledge.add_documents(docs)
+await knowledge.add_documents(documents + pdf_documents)
 
-# 검색
-results = await knowledge.retrieve("AgentScope란 무엇인가?", limit=5)
-```
-
-### 에이전트 통합
-
-```python
-agent = ReActAgent(
-    name="rag_agent",
-    knowledge_base=knowledge,  # 에이전트에 지식 베이스 연결
-    ...
+# 유사도 검색
+docs = await knowledge.retrieve(
+    query="What is Tony Stank's password?",
+    limit=3,
+    score_threshold=0.7,
 )
-# 에이전트가 자동으로 retrieve_knowledge 툴을 사용
+for doc in docs:
+    print(f"Document ID: {doc.id}, Score: {doc.score}, Content: {doc.metadata.content['text']}")
 ```
 
-### 멀티모달 RAG
-
-```python
-mm_embedding = DashScopeMultimodalEmbedding(...)
-# 이미지와 텍스트를 함께 임베딩하여 검색
-```
+**핵심 포인트:**
+- `TextReader`는 파일 경로 대신 `text=` 파라미터로 직접 텍스트 파싱 가능
+- `split_by="sentence"` — 문장 단위 청킹
+- `dimensions=1024` — `text-embedding-v4` 모델의 벡터 차원
 
 ---
 
-## 2. short_term_memory — 단기 메모리 관리
+## 2. structured_output — 구조화 출력
 
-### 메모리 압축 (MemoryWithCompress)
+**파일**: `main.py`
+
+**실제 코드:**
 
 ```python
+# examples/functionality/structured_output/main.py
+class TableModel(BaseModel):
+    name: str = Field(description="The name of the person")
+    age: int = Field(description="The age of the person", ge=0, le=120)
+    intro: str = Field(description="A one-sentence introduction")
+    honors: list[str] = Field(description="A list of honors received")
+
+class ChoiceModel(BaseModel):
+    choice: Literal["apple", "banana", "orange"] = Field(
+        description="Your choice of fruit",
+    )
+
+agent = ReActAgent(
+    name="Friday",
+    sys_prompt="You are a helpful assistant named Friday.",
+    model=DashScopeChatModel(
+        api_key=os.environ.get("DASHSCOPE_API_KEY"),
+        model_name="qwen-max",
+        stream=True,
+    ),
+    formatter=DashScopeChatFormatter(),
+    toolkit=Toolkit(),
+    memory=InMemoryMemory(),
+)
+
+# TableModel로 구조화 출력
+res = await agent(Msg("user", "Please introduce Einstein", "user"),
+                  structured_model=TableModel)
+print(json.dumps(res.metadata, indent=4))
+
+# Literal 타입으로 선택지 제한
+res = await agent(Msg("user", "Choose one of your favorite fruit", "user"),
+                  structured_model=ChoiceModel)
+```
+
+**결과:** `res.metadata`에 Pydantic 모델로 파싱된 딕셔너리 저장
+
+---
+
+## 3. mcp — MCP 툴 연동
+
+**파일**: `main.py`, `mcp_add.py` (SSE 서버), `mcp_multiply.py` (StreamableHTTP 서버)
+
+**실제 코드:**
+
+```python
+# examples/functionality/mcp/main.py
+class NumberResult(BaseModel):
+    result: int = Field(description="The result of the calculation")
+
+toolkit = Toolkit()
+
+# SSE 전송 방식 (stateful)
+add_mcp_client = HttpStatefulClient(
+    name="add_mcp",
+    transport="sse",
+    url="http://127.0.0.1:8001/sse",
+)
+
+# StreamableHTTP 전송 방식 (stateless)
+multiply_mcp_client = HttpStatelessClient(
+    name="multiply_mcp",
+    transport="streamable_http",
+    url="http://127.0.0.1:8002/mcp",
+)
+
+await add_mcp_client.connect()
+await toolkit.register_mcp_client(add_mcp_client)
+await toolkit.register_mcp_client(multiply_mcp_client)
+
+agent = ReActAgent(
+    name="Jarvis",
+    sys_prompt="You're a helpful assistant named Jarvis.",
+    model=DashScopeChatModel(model_name="qwen-max", ...),
+    formatter=DashScopeChatFormatter(),
+    toolkit=toolkit,
+)
+
+# 구조화 출력 + MCP 툴 함께 사용
+res = await agent(
+    Msg("user", "Calculate 2345 multiplied by 3456, then add 4567...", "user"),
+    structured_model=NumberResult,
+)
+
+# MCP 툴을 로컬 callable로 직접 호출
+add_tool_function = await add_mcp_client.get_callable_function(
+    "add",
+    wrap_tool_result=True,  # ToolResponse로 래핑
+)
+manual_res = await add_tool_function(a=5, b=10)
+
+await add_mcp_client.close()  # stateful은 수동 close 필요
+```
+
+**핵심 포인트:**
+- `HttpStatefulClient` vs `HttpStatelessClient` — 연결 유지 여부
+- `get_callable_function()` — MCP 툴을 로컬 Python 함수처럼 직접 호출
+- `wrap_tool_result=True` — 결과를 `ToolResponse` 객체로 래핑
+
+---
+
+## 4. session_with_sqlite — SQLite 세션 영속성
+
+**파일**: `main.py`, `sqlite_session.py`
+
+`SqliteSession`은 커스텀 구현 (AgentScope 내장 `JSONSession` 패턴을 SQLite로 확장).
+
+**실제 코드:**
+
+```python
+# examples/functionality/session_with_sqlite/main.py
+async def main(username: str, query: str) -> None:
+    agent = ReActAgent(
+        name="friday",
+        sys_prompt="You are a helpful assistant named Friday.",
+        model=DashScopeChatModel(model_name="qwen-max", ...),
+        formatter=DashScopeChatFormatter(),
+    )
+
+    session = SqliteSession(SQLITE_PATH)
+
+    # 이전 세션 복원 (없으면 새로 시작)
+    await session.load_session_state(
+        session_id=username,
+        friday_of_user=agent,  # kwargs로 전달 = 상태 모듈 이름
+    )
+
+    await agent(Msg("user", query, "user"))
+
+    # 상태 저장
+    await session.save_session_state(
+        session_id=username,
+        friday_of_user=agent,
+    )
+
+# Alice와 Bob 각각 독립 세션
+asyncio.run(main("alice", "What's the capital of America?"))
+asyncio.run(main("bob", "What's the capital of China?"))
+
+# Alice 세션 복원 후 이전 대화 확인
+asyncio.run(main("alice", "What did I ask you before?"))
+```
+
+**핵심 포인트:** `session_id=username` + `kwargs`로 상태 모듈 이름 지정 — 멀티 에이전트도 동시 저장 가능
+
+---
+
+## 5. short_term_memory — 단기 메모리
+
+**파일**: `memory_compression/main.py`, `reme/reme_short_term_memory.py`
+
+### memory_compression/main.py
+
+```python
+from agentscope.memory import InMemoryMemory
+from agentscope.agent import ReActAgent
+
 agent = ReActAgent(
     name="assistant",
     memory=InMemoryMemory(),
     compression_config=ReActAgent.CompressionConfig(
         enable=True,
-        agent_token_counter=CharTokenCounter(),
-        trigger_threshold=2000,  # 토큰 임계값
-        keep_recent=3,           # 최근 N개 메시지 보존
+        trigger_threshold=3000,  # 3000 토큰 초과 시 압축
+        keep_recent=5,           # 최근 5개 메시지 보존
     ),
+    ...
 )
-```
-
-### ReMe 단기 메모리
-
-```python
-from agentscope.memory import ReMeShortTermMemory
-
-memory = ReMeShortTermMemory(
-    model=DashScopeChatModel(...),
-    max_tokens=1500,
-)
-agent = ReActAgent(memory=memory, ...)
 ```
 
 ---
 
-## 3. long_term_memory — 장기 메모리
+## 6. long_term_memory — 장기 메모리
 
-### ReMe 개인 메모리
+**파일**: `reme/`, `mem0/`
+
+### ReMe 개인 장기 메모리
 
 ```python
+# reme/personal_memory_example.py
 from agentscope.memory import ReMePersonalLongTermMemory
 
-long_term = ReMePersonalLongTermMemory(
-    embedding_model=DashScopeTextEmbedding(...),
-    storage_path="./personal_memory/",
+memory = ReMePersonalLongTermMemory(
+    api_key=os.environ["REME_API_KEY"],
+    user_id="user_001",
 )
 
-agent = ReActAgent(
-    long_term_memory=long_term,
-    # 에이전트가 record_to_memory, retrieve_from_memory 툴 자동 사용
-    ...
-)
+# 대화 후 자동으로 개인 정보 추출 및 저장
+await memory.add([user_msg, assistant_msg])
+
+# 다음 대화에서 자동 검색
+relevant_memories = await memory.retrieve(query="사용자 선호도")
 ```
 
-### Mem0 통합
+### mem0 통합
 
 ```python
+# mem0/memory_example.py
 from agentscope.memory import Mem0LongTermMemory
 
-long_term = Mem0LongTermMemory(
+memory = Mem0LongTermMemory(
+    api_key=os.environ["MEM0_API_KEY"],
     user_id="user_001",
-    config={"vector_store": {"provider": "qdrant", ...}},
 )
 ```
 
 ---
 
-## 4. structured_output — 구조화된 출력
+## 7. plan — 플랜 관리
+
+**파일**: `main_agent_managed_plan.py`, `main_manual_plan.py`
 
 ```python
-from pydantic import BaseModel
-
-class PersonTable(BaseModel):
-    name: str
-    age: int
-    occupation: str
-
-class Choice(BaseModel):
-    answer: Literal["A", "B", "C", "D"]
-    reason: str
-
-# 구조화 출력 요청
-response = await agent(
-    Msg(name="user", content="...", role="user"),
-    structured_model=PersonTable,
-)
-# response.metadata에 검증된 Pydantic 객체 포함
-```
-
----
-
-## 5. plan — 플래닝
-
-### 수동 계획 생성
-
-```python
-from agentscope.plan import PlanNotebook, SubTask
+# main_agent_managed_plan.py (에이전트 자동 플랜 관리)
+from agentscope.functionality.plan import PlanNotebook
 
 notebook = PlanNotebook()
-plan = notebook.create_plan(
-    name="research_task",
-    subtasks=[
-        SubTask(name="검색", description="웹에서 정보 수집"),
-        SubTask(name="분석", description="수집된 정보 분석"),
-        SubTask(name="보고서", description="분석 결과 정리"),
-    ]
-)
-```
-
-### 에이전트 자동 계획
-
-```python
 agent = ReActAgent(
-    plan_notebook=PlanNotebook(),
-    enable_meta_tool=True,  # 에이전트가 직접 계획 생성 가능
+    name="planner",
+    plan_notebook=notebook,
     ...
 )
+# 에이전트가 자동으로 plan 생성/업데이트
+
+# main_manual_plan.py (수동 플랜 관리)
+plan = PlanNotebook()
+await plan.add_task(SubTask(description="서브태스크 1"))
+await plan.mark_completed(task_id)
 ```
 
 ---
 
-## 6. mcp — Model Context Protocol
+## 8. tts — 텍스트 음성 합성
+
+**파일**: `main.py`
 
 ```python
-# HTTP SSE 클라이언트
-sse_client = HttpStatefulClient(
-    name="server1",
-    url="http://localhost:8080/sse",
-)
+# examples/functionality/tts/main.py
+from agentscope.tts import DashScopeTTSModel
 
-# Streamable HTTP 클라이언트 (무상태)
-http_client = HttpStatelessClient(
-    name="server2",
-    url="http://localhost:8081/mcp",
-)
-
-toolkit = Toolkit()
-await toolkit.register_mcp_client(sse_client)
-await toolkit.register_mcp_client(http_client)
-
-agent = ReActAgent(toolkit=toolkit, ...)
-```
-
-**동봉 MCP 서버 예제**:
-- `mcp_add.py` — 덧셈 툴 서버
-- `mcp_multiply.py` — 곱셈 툴 서버
-
----
-
-## 7. tts — 텍스트-음성 변환
-
-```python
-from agentscope.tts import DashScopeRealtimeTTSModel
-
-tts = DashScopeRealtimeTTSModel(
-    model_name="cosyvoice-v1",
-    voice="longyuan",
+tts = DashScopeTTSModel(
+    model_name="qwen3-tts-flash",
+    api_key=os.environ["DASHSCOPE_API_KEY"],
+    voice="Cherry",
+    stream=True,
 )
 
 agent = ReActAgent(
-    name="voice_agent",
-    tts_model=tts,   # 응답을 자동으로 음성으로 변환
+    name="voice_assistant",
+    tts_model=tts,
     ...
 )
-```
-
----
-
-## 8. agent_skill — 에이전트 스킬
-
-```python
-# 스킬 디렉토리 구조
-# skill/
-#   ├── agentscope_overview.md
-#   └── api_reference.md
-
-toolkit = Toolkit()
-toolkit.register_agent_skills("./skill/")
-# 스킬이 에이전트의 지식으로 등록됨
-
-agent = ReActAgent(toolkit=toolkit, ...)
 ```
 
 ---
 
 ## 9. stream_printing_messages — 스트리밍 출력
 
+**파일**: `single_agent.py`, `multi_agent.py`
+
 ```python
+# multi_agent.py
 from agentscope.pipeline import stream_printing_messages
 
-# 에이전트 콘솔 직접 출력 비활성화
-agent.set_console_output_enabled(False)
-
-# 스트리밍으로 응답 처리
 async for msg, is_last in stream_printing_messages(
-    agents=[agent],
-    coroutine_task=agent(user_msg),
+    agents=[agent_a, agent_b],
+    coroutine_task=agent_a(user_msg),
 ):
-    print(msg.content, end="", flush=True)
-    if is_last:
-        print()
+    print(f"[{msg.name}]: {msg.get_text_content()}")
 ```
 
 ---
 
-## 10. session_with_sqlite — SQLite 세션
+## 10. vector_store — 벡터 스토어
+
+**파일**: `milvus_lite/`, `mongodb/`, `alibabacloud_mysql_vector/`, `oceanbase/`
+
+각 디렉토리에 해당 DB와 AgentScope RAG 연동 예제.
 
 ```python
-from agentscope.session import SqliteSession
-
-session = SqliteSession(db_path="./conversations.db")
-
-# 멀티 유저 지원
-await session.load_session_state(
-    session_id="chat_001",
-    user_id="alice",
-    agent=agent,
-    allow_not_exist=True,
-)
-
-# 대화 후 저장
-await session.save_session_state(
-    session_id="chat_001",
-    user_id="alice",
-    agent=agent,
-)
-```
-
----
-
-## 11. vector_store — 벡터 DB 연동
-
-다양한 벡터 DB 백엔드 예제:
-
-| 벡터 DB | 디렉토리 | 특징 |
-|---------|---------|------|
-| MongoDB Atlas | `mongodb/` | 클라우드, 필터링 |
-| Milvus Lite | `milvus_lite/` | 경량 임베디드 |
-| OceanBase | `oceanbase/` | 알리바바 클라우드 |
-| MySQL Vector | `alibabacloud_mysql_vector/` | SQL 기반 벡터 검색 |
-
-```python
-# Milvus Lite 예시
+# milvus_lite/main.py
 from agentscope.rag import MilvusLiteStore
 
 store = MilvusLiteStore(
-    uri="./milvus.db",
+    uri="./milvus_lite.db",
     collection_name="docs",
-    embedding_dim=1024,
-    metric_type="COSINE",
+    dimensions=1024,
 )
 ```
 
 ---
 
-## 기능별 의존 모듈 매핑
+## 11. agent_skill — 에이전트 스킬
 
-| 예제 | 핵심 모듈 |
-|------|----------|
-| rag | RAG, Embedding, VDB |
-| short_term_memory | Memory |
-| long_term_memory | Memory, Embedding |
-| structured_output | Agent, Message |
-| plan | Plan, Agent |
-| mcp | MCP, Tool |
-| tts | TTS, Agent |
-| agent_skill | Tool |
-| stream_printing | Pipeline |
-| session_with_sqlite | Session |
-| vector_store | RAG, Embedding |
+**파일**: `main.py`, `skill/`
+
+Anthropic Agent Skills 패턴. 스킬을 Toolkit에 등록하여 에이전트가 활용.
+
+```python
+# main.py
+from agentscope.tool import Toolkit
+
+toolkit = Toolkit()
+await toolkit.register_skill_from_directory("./skill/")
+# 스킬 디렉토리의 모든 도구를 자동 등록
+```

@@ -4,13 +4,154 @@
 
 ## 파일 목록 (5개)
 
-| 파일 | 테스트 대상 |
-|------|-----------|
+| 파일 | 테스트 클래스 |
+|------|-------------|
 | `tool_test.py` | 내장 툴 함수 (Python/Shell/파일) |
-| `toolkit_basic_test.py` | Toolkit 핵심 동작 |
+| `toolkit_basic_test.py` | `ToolkitBasicTest` |
 | `toolkit_meta_tool_test.py` | 메타 툴 기능 |
 | `toolkit_middleware_test.py` | 툴 실행 미들웨어 |
 | `tool_openai_test.py` / `tool_dashscope_test.py` | 모델별 툴 통합 |
+
+---
+
+## toolkit_basic_test.py
+
+**테스트 클래스:** `ToolkitBasicTest(IsolatedAsyncioTestCase)`
+
+**테스트용 툴 함수들:**
+
+```python
+def sync_func(arg1: int, arg2: Optional[list[Union[str, int]]] = None) -> str:
+    """동기 함수 툴"""
+    return f"arg1={arg1}, arg2={arg2}"
+
+async def async_func(raise_cancel: bool = False) -> str:
+    """비동기 함수 툴"""
+    if raise_cancel:
+        raise asyncio.CancelledError("취소됨")
+    return "async 완료"
+
+async def async_generator_func(raise_cancel: bool = False):
+    """스트리밍 비동기 제너레이터 툴"""
+    for i in range(3):
+        yield ToolResponse(
+            content=[TextBlock(type="text", text=f"chunk_{i}")],
+            stream=True,
+            is_last=(i == 2),
+        )
+    if raise_cancel:
+        raise asyncio.CancelledError("취소됨")
+
+def sync_generator_func():
+    """동기 제너레이터 툴"""
+    for i in range(3):
+        yield ToolResponse(
+            content=[TextBlock(type="text", text=f"sync_chunk_{i}")],
+            stream=True,
+            is_last=(i == 2),
+        )
+
+async def async_func_return_async_generator(n: int):
+    """비동기 함수가 비동기 제너레이터를 반환"""
+    async def gen():
+        for i in range(n):
+            yield f"item_{i}"
+    return gen()
+
+async def async_func_return_sync_generator(n: int):
+    """비동기 함수가 동기 제너레이터를 반환"""
+    def gen():
+        for i in range(n):
+            yield f"item_{i}"
+    return gen()
+```
+
+**구조화 모델 지원 테스트:**
+
+```python
+class StructuredModel(BaseModel):
+    arg3: int
+
+class MyBaseModel1(BaseModel):
+    field_a: str
+
+class MyBaseModel2(BaseModel):
+    field_b: int
+
+class ExtendedModelReusingBaseModel(MyBaseModel1, MyBaseModel2):
+    """다중 상속 Pydantic 모델"""
+    pass
+```
+
+**핵심 테스트 패턴:**
+
+```python
+# 동기 함수 등록 및 호출
+toolkit = Toolkit()
+toolkit.register_tool_function(sync_func)
+
+response = await toolkit.call_tool(
+    ToolUseBlock(id="1", name="sync_func", input={"arg1": 42}, type="tool_use",
+                 raw_input='{"arg1": 42}')
+)
+self.assertIn("42", str(response))
+
+# 스트리밍 제너레이터 툴
+async for response in toolkit.call_tool(
+    ToolUseBlock(id="2", name="async_generator_func",
+                 input={"raise_cancel": False}, type="tool_use",
+                 raw_input='{"raise_cancel": false}')
+):
+    self.assertIsInstance(response, ToolResponse)
+    self.assertTrue(response.stream)
+```
+
+**취소 처리:**
+
+```python
+# asyncio.CancelledError 발생 시 응답에 에러 포함
+response = await toolkit.call_tool(
+    ToolUseBlock(..., input={"raise_cancel": True})
+)
+# CancelledError가 ToolResponse로 감싸져 반환됨
+```
+
+---
+
+## toolkit_middleware_test.py
+
+미들웨어 체인 실행 순서 검증.
+
+```python
+async def test_middleware_execution_order(self):
+    order = []
+
+    def middleware_a(next_call):
+        async def wrapper(tool_call, **kwargs):
+            order.append("a_before")
+            result = await next_call(tool_call, **kwargs)
+            order.append("a_after")
+            return result
+        return wrapper
+
+    def middleware_b(next_call):
+        async def wrapper(tool_call, **kwargs):
+            order.append("b_before")
+            result = await next_call(tool_call, **kwargs)
+            order.append("b_after")
+            return result
+        return wrapper
+
+    toolkit = Toolkit()
+    toolkit.add_middleware(middleware_a)
+    toolkit.add_middleware(middleware_b)
+    toolkit.register_tool_function(simple_func)
+
+    await toolkit.call_tool(tool_call)
+
+    # 중첩 실행 순서: a_before → b_before → 실제 실행 → b_after → a_after
+    self.assertEqual(order, ["a_before", "b_before", "b_after", "a_after"])
+```
 
 ---
 
@@ -22,184 +163,60 @@
 class TestToolFunctions(IsolatedAsyncioTestCase):
 
     async def test_execute_python_code(self):
-        """Python 코드 실행 및 출력 캡처"""
-        result = await execute_python_code(
-            code="print('hello world')\nx = 1 + 1\nprint(x)"
-        )
+        result = await execute_python_code(code="print('hello')\nprint(1+1)")
         self.assertEqual(result.return_code, 0)
-        self.assertIn("hello world", result.stdout)
+        self.assertIn("hello", result.stdout)
         self.assertIn("2", result.stdout)
 
     async def test_python_code_error(self):
-        """오류 발생 시 에러 메시지 반환"""
-        result = await execute_python_code(
-            code="raise ValueError('테스트 오류')"
-        )
+        result = await execute_python_code(code="raise ValueError('오류')")
         self.assertNotEqual(result.return_code, 0)
         self.assertIn("ValueError", result.stderr)
 
     async def test_python_code_timeout(self):
-        """무한 루프 코드 타임아웃 처리"""
         result = await execute_python_code(
             code="while True: pass",
             timeout=2,
         )
         self.assertNotEqual(result.return_code, 0)
-        self.assertIn("timeout", result.stderr.lower())
 
     async def test_execute_shell_command(self):
-        """셸 명령어 실행"""
         result = await execute_shell_command(command="echo hello")
         self.assertEqual(result.return_code, 0)
         self.assertIn("hello", result.stdout)
 
-    async def test_view_text_file(self):
-        """파일 내용 읽기 (범위 지정)"""
-        # 임시 파일 생성
+    async def test_view_text_file_range(self):
+        """범위 지정 파일 읽기"""
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
             f.write("line1\nline2\nline3\nline4\nline5\n")
             temp_path = f.name
 
-        # 2~4번째 줄만 읽기
         result = await view_text_file(path=temp_path, start=2, end=4)
         self.assertIn("line2", result)
-        self.assertIn("line3", result)
         self.assertNotIn("line1", result)
 
-    async def test_tilde_expansion(self):
-        """경로에서 ~ 자동 확장"""
-        result = await view_text_file(path="~/nonexistent.txt")
-        # ~ 가 실제 홈 디렉토리로 확장됐는지 검증
-
     async def test_write_text_file(self):
-        """파일 쓰기"""
         temp_path = tempfile.mktemp(suffix='.txt')
         await write_text_file(path=temp_path, content="테스트 내용")
-
         with open(temp_path) as f:
             self.assertEqual(f.read(), "테스트 내용")
 ```
 
 ---
 
-## toolkit_basic_test.py
-
-Toolkit 클래스의 핵심 기능 검증.
-
-```python
-class TestToolkit(IsolatedAsyncioTestCase):
-
-    async def test_register_sync_function(self):
-        """동기 함수 등록 및 호출"""
-        def add(a: int, b: int) -> int:
-            return a + b
-
-        toolkit = Toolkit()
-        toolkit.register_tool_function(add)
-
-        self.assertIn("add", toolkit.tools)
-
-        response = await toolkit.call_tool(
-            ToolUseBlock(id="1", name="add", input={"a": 1, "b": 2}, ...)
-        )
-        # 응답에 "3" 포함되어야 함
-
-    async def test_register_async_function(self):
-        """비동기 함수 등록 및 호출"""
-        async def async_search(query: str) -> str:
-            return f"{query}에 대한 검색 결과"
-
-        toolkit = Toolkit()
-        toolkit.register_tool_function(async_search)
-        # 비동기 함수도 정상 동작해야 함
-
-    async def test_register_generator_function(self):
-        """비동기 제너레이터 함수 (스트리밍 툴)"""
-        async def stream_data(n: int):
-            for i in range(n):
-                yield f"데이터 {i}"
-
-        toolkit = Toolkit()
-        toolkit.register_tool_function(stream_data)
-
-        responses = []
-        async for response in toolkit.call_tool(
-            ToolUseBlock(id="1", name="stream_data", input={"n": 3}, ...)
-        ):
-            responses.append(response)
-
-        self.assertEqual(len(responses), 3)
-
-    async def test_tool_group_activation(self):
-        """툴 그룹 활성화/비활성화"""
-        toolkit = Toolkit()
-        toolkit.register_tool_function(search, group_name="search_tools")
-        toolkit.create_tool_group("search_tools", active=True)
-
-        # 비활성화
-        toolkit.update_tool_groups(["search_tools"], active=False)
-
-        # 비활성화된 그룹의 툴은 호출 불가
-        with self.assertRaises(ToolGroupInactiveError):
-            await toolkit.call_tool(ToolUseBlock(name="search", ...))
-
-    async def test_tool_execution_error_handling(self):
-        """툴 실행 오류 시 ToolResponse에 에러 포함"""
-        def failing_tool():
-            raise RuntimeError("툴 실행 실패")
-
-        toolkit.register_tool_function(failing_tool)
-        response = await toolkit.call_tool(ToolUseBlock(name="failing_tool", ...))
-
-        self.assertIn("RuntimeError", response.content[0].text)
-```
-
----
-
-## toolkit_middleware_test.py
-
-미들웨어 체인 동작 검증.
-
-```python
-async def test_middleware_execution_order(self):
-    """미들웨어 실행 순서 검증"""
-    order = []
-
-    def middleware_a(next_call):
-        async def wrapper(tool_call):
-            order.append("a_before")
-            result = await next_call(tool_call)
-            order.append("a_after")
-            return result
-        return wrapper
-
-    def middleware_b(next_call):
-        async def wrapper(tool_call):
-            order.append("b_before")
-            result = await next_call(tool_call)
-            order.append("b_after")
-            return result
-        return wrapper
-
-    toolkit.add_middleware(middleware_a)
-    toolkit.add_middleware(middleware_b)
-
-    await toolkit.call_tool(...)
-    self.assertEqual(order, ["a_before", "b_before", "b_after", "a_after"])
-```
-
----
-
 ## 검증 항목 요약
 
-| 항목 | tool_test | toolkit_basic | middleware | openai/dashscope |
-|------|----------|--------------|------------|-----------------|
-| Python 코드 실행 | ✓ | — | — | — |
-| 타임아웃 처리 | ✓ | — | — | — |
-| 셸 명령어 | ✓ | — | — | — |
-| 파일 읽기/쓰기 | ✓ | — | — | — |
-| 동기/비동기 등록 | — | ✓ | — | — |
-| 스트리밍 툴 | — | ✓ | — | — |
-| 그룹 관리 | — | ✓ | — | — |
-| 미들웨어 체인 | — | — | ✓ | — |
-| 모델 통합 | — | — | — | ✓ |
+| 항목 | tool_test | toolkit_basic | middleware |
+|------|----------|--------------|------------|
+| Python 코드 실행 | ✓ | — | — |
+| 타임아웃 처리 | ✓ | — | — |
+| 셸 명령어 | ✓ | — | — |
+| 파일 읽기/쓰기 | ✓ | — | — |
+| 동기 함수 등록 | — | ✓ | — |
+| 비동기 함수 등록 | — | ✓ | — |
+| async 제너레이터 툴 | — | ✓ | — |
+| sync 제너레이터 툴 | — | ✓ | — |
+| CancelledError 처리 | — | ✓ | — |
+| 다중 상속 Pydantic 모델 | — | ✓ | — |
+| 미들웨어 실행 순서 | — | — | ✓ |
+| 미들웨어 입출력 수정 | — | — | ✓ |
